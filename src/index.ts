@@ -1,0 +1,300 @@
+#!/usr/bin/env node
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { z } from "zod";
+import { eda } from "./eda.js";
+import { browserManager } from "./browser.js";
+
+/**
+ * MCP-сервер Яндекс Еды.
+ *
+ * Транспорт — stdio, поэтому в stdout нельзя писать ничего, кроме протокола.
+ * Любые логи шлём в stderr.
+ */
+const server = new McpServer({
+  name: "yandex-eda-mcp",
+  version: "0.1.0",
+});
+
+function ok(text: string) {
+  return { content: [{ type: "text" as const, text }] };
+}
+function json(data: unknown) {
+  return ok(JSON.stringify(data, null, 2));
+}
+function fail(text: string) {
+  return { content: [{ type: "text" as const, text }], isError: true };
+}
+
+// --- Авторизация -----------------------------------------------------------
+server.registerTool(
+  "login_status",
+  {
+    title: "Статус авторизации",
+    description:
+      "Проверяет, авторизован ли текущий профиль браузера в Яндексе. " +
+      "Если не авторизован — вызовите инструмент `login` (откроется окно входа).",
+    inputSchema: {},
+  },
+  async () => {
+    const res = await eda.isLoggedIn();
+    return json(res);
+  }
+);
+
+server.registerTool(
+  "login",
+  {
+    title: "Войти в Яндекс",
+    description:
+      "Открывает видимое окно браузера для входа в аккаунт Яндекса (логин/пароль/" +
+      "SMS/капча). После входа сессия сохраняется в профиль, и сервер работает " +
+      "headless. Нужно один раз на компьютере. Обычно вызывается автоматически " +
+      "при первом обращении к сайту, но можно и вручную.",
+    inputSchema: {},
+  },
+  async () => {
+    const res = await eda.interactiveLogin();
+    return res.ok ? ok(res.message) : fail(res.message);
+  }
+);
+
+// --- Адрес доставки --------------------------------------------------------
+server.registerTool(
+  "get_address",
+  {
+    title: "Текущий адрес доставки",
+    description:
+      "Возвращает текущий адрес доставки (метку сохранённого адреса, например «Дом», " +
+      "или улицу). Полезно спросить у пользователя «ищем тут?» перед поиском.",
+    inputSchema: {},
+  },
+  async () => {
+    const addr = await eda.getCurrentAddress();
+    return ok(addr ? `Текущий адрес: ${addr}` : "Адрес не задан.");
+  }
+);
+
+server.registerTool(
+  "list_saved_addresses",
+  {
+    title: "Сохранённые адреса",
+    description:
+      "Возвращает сохранённые в аккаунте адреса доставки (с метками «Дом», " +
+      "«На работу» и деталями — подъезд/этаж/квартира). Их можно выбрать через " +
+      "set_address без повторного ввода на карте.",
+    inputSchema: {},
+  },
+  async () => {
+    const list = await eda.getSavedAddresses();
+    if (!list.length)
+      return ok("Сохранённых адресов не найдено (или нет активного адреса).");
+    return json({ count: list.length, addresses: list });
+  }
+);
+
+server.registerTool(
+  "set_address",
+  {
+    title: "Задать адрес доставки",
+    description:
+      "Устанавливает адрес доставки. По умолчанию СНАЧАЛА ищет совпадение среди " +
+      "сохранённых адресов (по метке «дом»/«работа» или улице) и выбирает его " +
+      "мгновенно, СОХРАНЯЯ квартиру/подъезд/этаж — без повторного тыканья по карте. " +
+      "Если сохранённого нет — вводит новый адрес через поиск на карте.",
+    inputSchema: {
+      address: z
+        .string()
+        .describe("Адрес или метка: «домой», «на работу», «Москва, Тверская 1»"),
+      preferSaved: z
+        .boolean()
+        .optional()
+        .default(true)
+        .describe(
+          "true (по умолч.) — сперва искать среди сохранённых; false — сразу вводить новый"
+        ),
+    },
+  },
+  async ({ address, preferSaved }) => {
+    const res = await eda.setAddress(address, { preferSaved });
+    return res.ok ? ok(res.message) : fail(res.message);
+  }
+);
+
+// --- Рестораны и меню ------------------------------------------------------
+server.registerTool(
+  "search_restaurants",
+  {
+    title: "Поиск ресторанов",
+    description:
+      "Ищет рестораны/магазины по запросу (или отдаёт каталог для текущего адреса, " +
+      "если запрос не задан). Требуется заранее установленный адрес доставки.",
+    inputSchema: {
+      query: z
+        .string()
+        .optional()
+        .describe("Что искать: кухня, название, блюдо. Пусто = весь каталог"),
+      limit: z.number().int().min(1).max(50).optional().default(20),
+    },
+  },
+  async ({ query, limit }) => {
+    const list = await eda.searchRestaurants(query);
+    const sliced = list.slice(0, limit).map((r) => ({
+      name: r.name,
+      rating: r.rating,
+      deliveryTime: r.deliveryTime,
+      url: r.url ?? r.slug,
+      categories: r.categories,
+    }));
+    if (!sliced.length) {
+      return fail(
+        "Ничего не найдено. Убедитесь, что задан адрес (set_address) и вы вошли (login)."
+      );
+    }
+    return json({ count: sliced.length, restaurants: sliced });
+  }
+);
+
+server.registerTool(
+  "get_menu",
+  {
+    title: "Меню ресторана",
+    description:
+      "Открывает ресторан и возвращает его меню. Принимает URL или slug из search_restaurants.",
+    inputSchema: {
+      restaurant: z
+        .string()
+        .describe("URL ресторана или его slug (из результатов поиска)"),
+      limit: z.number().int().min(1).max(200).optional().default(80),
+    },
+  },
+  async ({ restaurant, limit }) => {
+    const { restaurant: name, items } = await eda.getMenu(restaurant);
+    if (!items.length) {
+      return fail(
+        `Меню для «${name}» не распознано. Возможно, ресторан недоступен по текущему адресу.`
+      );
+    }
+    return json({
+      restaurant: name,
+      count: items.length,
+      items: items.slice(0, limit).map((i) => ({
+        name: i.name,
+        price: i.price,
+        weight: i.weight,
+        description: i.description,
+      })),
+    });
+  }
+);
+
+// --- Корзина и заказ -------------------------------------------------------
+server.registerTool(
+  "add_to_cart",
+  {
+    title: "Добавить в корзину",
+    description:
+      "Добавляет позицию в корзину по названию. Должна быть открыта страница нужного " +
+      "ресторана (сначала вызовите get_menu).",
+    inputSchema: {
+      item: z.string().describe("Название блюда как в меню"),
+      quantity: z.number().int().min(1).max(20).optional().default(1),
+    },
+  },
+  async ({ item, quantity }) => {
+    const res = await eda.addToCart(item, quantity);
+    return res.ok ? ok(res.message) : fail(res.message);
+  }
+);
+
+server.registerTool(
+  "view_cart",
+  {
+    title: "Показать корзину",
+    description: "Возвращает содержимое корзины и итоговую сумму.",
+    inputSchema: {},
+  },
+  async () => {
+    const cart = await eda.getCart();
+    return json({
+      total: cart.total,
+      items: cart.items.map((i) => ({ name: i.name, price: i.price })),
+    });
+  }
+);
+
+server.registerTool(
+  "place_order",
+  {
+    title: "Оформить заказ",
+    description:
+      "Оформляет заказ из корзины. ПО УМОЛЧАНИЮ безопасный dry-run: доходит до кнопки " +
+      "оформления, но НЕ подтверждает. Для реального заказа передайте confirm=true.",
+    inputSchema: {
+      confirm: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe("true = реально оформить заказ и списать оплату"),
+      comment: z.string().optional().describe("Комментарий курьеру/ресторану"),
+    },
+  },
+  async ({ confirm, comment }) => {
+    const res = await eda.placeOrder({ confirm, comment });
+    return res.ok ? ok(res.message) : fail(res.message);
+  }
+);
+
+// --- Навигация и отладка ---------------------------------------------------
+server.registerTool(
+  "navigate",
+  {
+    title: "Перейти по адресу",
+    description: "Переходит по пути или полному URL внутри Яндекс Еды.",
+    inputSchema: {
+      path: z.string().describe("Путь (/orders) или полный URL"),
+    },
+  },
+  async ({ path }) => {
+    const res = await eda.goto(path);
+    return json(res);
+  }
+);
+
+server.registerTool(
+  "debug_snapshot",
+  {
+    title: "Снимок страницы (отладка)",
+    description:
+      "Возвращает URL, заголовок и текст текущей страницы, а также сохраняет скриншот. " +
+      "Помогает подстроить селекторы при изменении вёрстки сайта.",
+    inputSchema: {
+      screenshot: z.boolean().optional().default(true),
+    },
+  },
+  async ({ screenshot }) => {
+    const snap = await eda.snapshot();
+    let file: string | undefined;
+    if (screenshot) file = await eda.screenshot("debug");
+    return json({ ...snap, screenshot: file });
+  }
+);
+
+// --- Запуск ----------------------------------------------------------------
+async function main() {
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  process.stderr.write("[yandex-eda-mcp] сервер запущен (stdio)\n");
+}
+
+async function shutdown() {
+  await browserManager.close().catch(() => {});
+  process.exit(0);
+}
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
+
+main().catch((err) => {
+  process.stderr.write(`[yandex-eda-mcp] фатальная ошибка: ${err?.stack || err}\n`);
+  process.exit(1);
+});

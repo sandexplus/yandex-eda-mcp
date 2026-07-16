@@ -1,0 +1,11 @@
+node_modules/
+dist/
+*.log
+.idea
+
+# Персональный профиль браузера с авторизацией — НИКОГДА не коммитить
+.profile/
+user-data/
+storage-state.json
+.env
+screenshots/

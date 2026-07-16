@@ -1,0 +1,45 @@
+{
+  "name": "yandex-eda-mcp",
+  "version": "0.1.0",
+  "description": "MCP-сервер для Яндекс Еды через Playwright (headless): поиск ресторанов, меню, корзина, оформление заказа",
+  "type": "module",
+  "bin": {
+    "yandex-eda-mcp": "dist/index.js"
+  },
+  "main": "dist/index.js",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js",
+    "login": "node dist/scripts/login.js",
+    "prepare": "tsc",
+    "postinstall": "playwright install chromium"
+  },
+  "keywords": [
+    "mcp",
+    "yandex",
+    "eda",
+    "playwright",
+    "model-context-protocol"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "playwright": "^1.49.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  }
+}
