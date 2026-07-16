@@ -1,4 +1,4 @@
-import type { Page, Response } from "playwright";
+import type { Page, Response, BrowserContext } from "playwright";
 import fs from "node:fs";
 import path from "node:path";
 import { browserManager } from "./browser.js";
@@ -262,12 +262,22 @@ export class YandexEda {
    * (логин/пароль/SMS/капча — что угодно). Как только вход виден — сохраняет
    * сессию в профиль и возвращается в headless-режим.
    */
+  /**
+   * Есть ли в контексте валидная кука сессии Яндекса. Passport после входа
+   * ставит `Session_id` на `.yandex.ru`. Проверка НЕразрушающая — только читает
+   * куки, не трогая открытую пользователем страницу входа.
+   */
+  private async hasSessionCookie(ctx: BrowserContext): Promise<boolean> {
+    const cookies = await ctx.cookies().catch(() => []);
+    return cookies.some((c) => c.name === "Session_id" && !!c.value);
+  }
+
   async interactiveLogin(
     timeoutMs = LOGIN_TIMEOUT
   ): Promise<{ ok: boolean; message: string }> {
     // Видимое окно обязательно — капча/SMS в headless невозможны.
-    await browserManager.reopen(false);
-    let page = await this.page();
+    const ctx = await browserManager.reopen(false);
+    const page = ctx.pages()[0] ?? (await ctx.newPage());
 
     // Уже залогинены? Тогда просто вернёмся в headless.
     if (!(await this.needsLogin(page))) {
@@ -275,18 +285,18 @@ export class YandexEda {
       return { ok: true, message: "Уже авторизованы — вход не потребовался." };
     }
 
+    // Ведём на страницу входа и БОЛЬШЕ НЕ трогаем её — пользователь спокойно
+    // вводит логин/пароль/SMS/капчу. Готовность ловим по куке сессии, а не
+    // перезагрузкой страницы (иначе вход невозможно завершить).
     await page
       .goto(PASSPORT_URL, { waitUntil: "domcontentloaded" })
       .catch(() => {});
 
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-      await page.waitForTimeout(3000);
-      // Периодически возвращаемся на Еду и проверяем, вошёл ли пользователь.
-      await page
-        .goto(BASE_URL, { waitUntil: "domcontentloaded" })
-        .catch(() => {});
-      if (!(await this.needsLogin(page))) {
+      await page.waitForTimeout(2000);
+      if (await this.hasSessionCookie(ctx)) {
+        await page.waitForTimeout(1500); // дать докатиться остальным кукам
         await browserManager.reopen(true);
         return {
           ok: true,
