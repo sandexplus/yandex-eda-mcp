@@ -218,29 +218,26 @@ export class YandexEda {
     }
   }
 
-  /** Проверяет, авторизован ли пользователь. */
+  /**
+   * Авторитетная проверка авторизации — по куке сессии Яндекса `Session_id`.
+   * Надёжнее DOM-селекторов: не зависит от вёрстки и от анти-бот-заглушек,
+   * которые Яндекс показывает свежему гостю в headless (из-за них старый
+   * детект по кнопке «Войти» ошибочно считал гостя залогиненным).
+   */
+  async isAuthenticated(): Promise<boolean> {
+    const ctx = await browserManager.getContext();
+    return this.hasSessionCookie(ctx);
+  }
+
+  /** Проверяет, авторизован ли пользователь (по куке сессии). */
   async isLoggedIn(): Promise<{ loggedIn: boolean; details: string }> {
-    const page = await this.page();
-    await this.ensureOnSite(page);
-    const marker = await firstVisible(page, SELECTORS.loggedInMarker, 3000);
-    if (marker) {
-      return { loggedIn: true, details: "Найден элемент аккаунта в шапке." };
-    }
-    const loginBtn = await firstVisible(page, SELECTORS.loginButton, 2000);
-    if (loginBtn) {
-      return {
-        loggedIn: false,
-        details: "Найдена кнопка «Войти» — требуется авторизация.",
-      };
-    }
-    // Ни маркера аккаунта, ни кнопки «Войти» — вёрстка неоднозначна. На практике
-    // залогиненный профиль часто попадает сюда (маркер сменил класс), поэтому
-    // трактуем как «скорее авторизован», чтобы не дёргать окно входа зря.
-    return {
-      loggedIn: true,
-      details:
-        "Явной кнопки «Войти» нет — считаем сессию активной (маркер аккаунта не распознан).",
-    };
+    const authed = await this.isAuthenticated();
+    return authed
+      ? { loggedIn: true, details: "Активная сессия Яндекса (кука Session_id)." }
+      : {
+          loggedIn: false,
+          details: "Куки сессии нет — требуется вход. Вызовите инструмент `login`.",
+        };
   }
 
   /**
@@ -257,12 +254,6 @@ export class YandexEda {
   }
 
   /**
-   * Интерактивный вход: поднимает видимое окно браузера в том же профиле,
-   * ведёт на страницу входа Яндекса и ждёт, пока пользователь авторизуется
-   * (логин/пароль/SMS/капча — что угодно). Как только вход виден — сохраняет
-   * сессию в профиль и возвращается в headless-режим.
-   */
-  /**
    * Есть ли в контексте валидная кука сессии Яндекса. Passport после входа
    * ставит `Session_id` на `.yandex.ru`. Проверка НЕразрушающая — только читает
    * куки, не трогая открытую пользователем страницу входа.
@@ -272,6 +263,12 @@ export class YandexEda {
     return cookies.some((c) => c.name === "Session_id" && !!c.value);
   }
 
+  /**
+   * Интерактивный вход: поднимает видимое окно браузера в том же профиле,
+   * ведёт на страницу входа Яндекса и ждёт, пока пользователь авторизуется
+   * (логин/пароль/SMS/капча). Готовность ловим по появлению куки `Session_id`,
+   * не трогая страницу входа. После входа возвращаемся в headless.
+   */
   async interactiveLogin(
     timeoutMs = LOGIN_TIMEOUT
   ): Promise<{ ok: boolean; message: string }> {
@@ -279,8 +276,8 @@ export class YandexEda {
     const ctx = await browserManager.reopen(false);
     const page = ctx.pages()[0] ?? (await ctx.newPage());
 
-    // Уже залогинены? Тогда просто вернёмся в headless.
-    if (!(await this.needsLogin(page))) {
+    // Уже есть валидная сессия? Тогда вход не нужен.
+    if (await this.hasSessionCookie(ctx)) {
       await browserManager.reopen(true);
       return { ok: true, message: "Уже авторизованы — вход не потребовался." };
     }
@@ -315,13 +312,12 @@ export class YandexEda {
   }
 
   /**
-   * Гарантирует, что перед действием на сайте профиль авторизован. Если сервер
-   * видит явный признак «не залогинен» и авто-логин включён — открывает окно
-   * входа. Иначе бросает понятную ошибку.
+   * Гарантирует, что перед действием на сайте профиль авторизован. Проверка по
+   * куке `Session_id` (авторитетно). Если сессии нет и авто-логин включён —
+   * открывает окно входа. Иначе бросает понятную ошибку.
    */
   async ensureLoggedIn(): Promise<void> {
-    const page = await this.page();
-    if (!(await this.needsLogin(page))) return;
+    if (await this.isAuthenticated()) return;
     if (!isAutoLogin()) {
       throw new Error(
         "Профиль не авторизован. Вызовите инструмент `login` (или задайте YANDEX_EDA_AUTO_LOGIN=1)."
