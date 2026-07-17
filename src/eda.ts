@@ -138,12 +138,19 @@ export interface Restaurant {
   name: string;
   slug?: string;
   url?: string;
+  /** Тип заведения: "restaurant" (готовая еда) или "shop" (магазин/аптека/цветы). */
+  business?: string;
   rating?: number | string;
   deliveryTime?: string;
+  /** Стоимость доставки, если удалось распознать (например «Доставка 0₽»). */
+  deliveryPrice?: string;
   categories?: string[];
   minOrder?: string;
   raw?: unknown;
 }
+
+/** Тип заведений для выдачи. */
+export type PlaceType = "restaurant" | "shop" | "all";
 
 export interface MenuItem {
   name: string;
@@ -615,14 +622,23 @@ export class YandexEda {
   }
 
   /**
-   * Ищет заведения. С запросом — через полнотекстовый поиск; без запроса —
-   * отдаёт каталог главной для текущего адреса. Требуется заданный адрес.
+   * Ищет заведения.
+   *
+   * - `query` пустой → отдаёт весь каталог для текущего адреса (для запроса
+   *   «кто вообще доставляет» ключевые слова НЕ нужны — тут и так все).
+   * - `query` задан → полнотекстовый поиск по названию/кухне/блюду.
+   * - `type` фильтрует выдачу: "restaurant" (по умолч., готовая еда),
+   *   "shop" (магазины/аптеки/цветы) или "all". Требуется заданный адрес.
    */
-  async searchRestaurants(query?: string): Promise<Restaurant[]> {
+  async searchRestaurants(
+    query?: string,
+    type: PlaceType = "restaurant"
+  ): Promise<Restaurant[]> {
     await this.ensureLoggedIn();
     const page = await this.page();
     const q = query?.trim();
 
+    let found: Restaurant[] = [];
     if (q) {
       const bodies = await collectJson(
         page,
@@ -635,8 +651,7 @@ export class YandexEda {
         },
         2500
       );
-      const found = this.parseSearchPlaces(bodies);
-      if (found.length) return found;
+      found = this.parseSearchPlaces(bodies);
     } else {
       const bodies = await collectJson(
         page,
@@ -647,12 +662,21 @@ export class YandexEda {
         },
         2500
       );
-      const found = this.parseCatalogPlaces(bodies);
-      if (found.length) return found;
+      found = this.parseCatalogPlaces(bodies);
     }
 
-    // Фолбэк: читаем карточки из DOM.
+    if (found.length) return this.filterByType(found, type);
+    // Фолбэк: читаем карточки из DOM (business неизвестен — не фильтруем).
     return this.parseRestaurantsFromDom(page);
+  }
+
+  /** Оставляет заведения нужного типа по полю `business`. */
+  private filterByType(places: Restaurant[], type: PlaceType): Restaurant[] {
+    if (type === "all") return places;
+    if (type === "shop")
+      return places.filter((p) => p.business && p.business !== "restaurant");
+    // По умолчанию — рестораны (готовая еда). Неизвестный business оставляем.
+    return places.filter((p) => !p.business || p.business === "restaurant");
   }
 
   /** Заведения из каталога «layout-constructor» (карусели `data.*`). */
@@ -676,13 +700,20 @@ export class YandexEda {
             const eta = Array.isArray(p.left_meta)
               ? p.left_meta.find((m: any) => m?.payload?.semantic_type === "eta")
               : null;
+            // Цена доставки иногда есть чипом («Доставка 0₽», «Бесплатная доставка»).
+            const deliveryPrice = Array.isArray(p.chips)
+              ? p.chips
+                  .map((c: any) => textVal(c?.payload?.text))
+                  .find((t: any) => t && /доставк|₽/i.test(t))
+              : undefined;
             out.push({
               name,
               slug,
+              business: p.brand?.business,
               url: `${BASE_URL}/restaurant/${slug}`,
               rating: textVal(p.features?.rating?.text),
               deliveryTime: textVal(eta?.payload?.text),
-              categories: p.brand?.business ? [p.brand.business] : undefined,
+              deliveryPrice,
             });
           }
         }
@@ -708,12 +739,24 @@ export class YandexEda {
           const slug = p?.slug;
           if (!name || !slug || seen.has(slug)) continue;
           seen.add(slug);
+          // rating/время лежат сегментами в lower_meta: ["4.2 (161)", "·", "25 мин"].
+          const lm: string[] = Array.isArray(p.lower_meta)
+            ? p.lower_meta
+                .map((m: any) => textVal(m?.payload?.text))
+                .filter((t: any): t is string => !!t && t !== "·")
+            : [];
+          const rating = lm.find((t: string) => /^\d[.,]\d/.test(t));
+          const deliveryTime =
+            textVal(p.delivery?.text) ??
+            lm.find((t: string) => /мин|\bч\b|\d{1,2}:\d{2}/i.test(t));
+          const web = p.link?.web ? String(p.link.web).split("?")[0] : undefined;
           out.push({
             name,
             slug,
-            url: `${BASE_URL}/restaurant/${slug}`,
-            rating: textVal(p.rating),
-            deliveryTime: textVal(p.delivery_time ?? p.eta),
+            business: p.business,
+            url: web ? `${BASE_URL}${web}` : `${BASE_URL}/restaurant/${slug}`,
+            rating,
+            deliveryTime,
             categories: Array.isArray(p.tags)
               ? p.tags.map((t: any) => t.title || t).filter(Boolean)
               : undefined,

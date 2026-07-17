@@ -125,33 +125,52 @@ server.registerTool(
 server.registerTool(
   "search_restaurants",
   {
-    title: "Поиск ресторанов",
+    title: "Поиск заведений",
     description:
-      "Ищет рестораны/магазины по запросу (или отдаёт каталог для текущего адреса, " +
-      "если запрос не задан). Требуется заранее установленный адрес доставки.",
+      "Отдаёт заведения, доставляющие на текущий адрес, с рейтингом и временем " +
+      "доставки (цена доставки — если распознана).\n" +
+      "• Для запроса «кто вообще доставляет / покажи подборку» вызывай БЕЗ `query` — " +
+      "вернётся весь каталог. НЕ придумывай ключевые слова (пицца/бургер): без них и так все.\n" +
+      "• `query` задавай только когда пользователь ищет конкретное (кухня, блюдо, название).\n" +
+      "• `type` разделяет выдачу: `restaurant` (по умолчанию, готовая еда) и `shop` " +
+      "(магазины/аптеки/цветы). Каталог смешанный — поэтому по умолчанию отдаём только рестораны.\n" +
+      "Требуется заранее установленный адрес (set_address).",
     inputSchema: {
       query: z
         .string()
         .optional()
-        .describe("Что искать: кухня, название, блюдо. Пусто = весь каталог"),
+        .describe(
+          "Конкретный запрос: кухня/блюдо/название. Пусто = весь каталог (для общей подборки — оставляй пустым)"
+        ),
+      type: z
+        .enum(["restaurant", "shop", "all"])
+        .optional()
+        .default("restaurant")
+        .describe(
+          "restaurant — рестораны (готовая еда, по умолч.); shop — магазины/аптеки/цветы; all — всё вперемешку"
+        ),
       limit: z.number().int().min(1).max(50).optional().default(20),
     },
   },
-  async ({ query, limit }) => {
-    const list = await eda.searchRestaurants(query);
+  async ({ query, type, limit }) => {
+    const list = await eda.searchRestaurants(query, type);
     const sliced = list.slice(0, limit).map((r) => ({
       name: r.name,
       rating: r.rating,
       deliveryTime: r.deliveryTime,
+      deliveryPrice: r.deliveryPrice,
+      type: r.business,
       url: r.url ?? r.slug,
       categories: r.categories,
     }));
     if (!sliced.length) {
+      const hint =
+        type === "shop" ? "магазинов" : type === "all" ? "заведений" : "ресторанов";
       return fail(
-        "Ничего не найдено. Убедитесь, что задан адрес (set_address) и вы вошли (login)."
+        `Не нашёл ${hint}. Убедитесь, что задан адрес (set_address) и вы вошли (login).`
       );
     }
-    return json({ count: sliced.length, restaurants: sliced });
+    return json({ count: sliced.length, type, restaurants: sliced });
   }
 );
 
