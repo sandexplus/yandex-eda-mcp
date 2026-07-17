@@ -455,7 +455,12 @@ export class YandexEda {
     return txt;
   }
 
-  /** Открывает попап со списком сохранённых адресов (нужен активный адрес). */
+  /**
+   * Открывает список сохранённых адресов. Работает в ОБОИХ состояниях:
+   * • есть активный адрес → попап «Куда доставить?» по клику на адрес в шапке;
+   * • адреса нет → модалка «Укажите адрес»; фокус на поле ввода показывает
+   *   сохранённые/недавние (zerosuggest) как li[role="option"].
+   */
   private async openSavedPopup(page: Page): Promise<boolean> {
     if (
       await page
@@ -464,25 +469,39 @@ export class YandexEda {
         .catch(() => false)
     )
       return true;
+
     const ctrl = this.addressControl(page);
-    // Ждём готовности шапки (при первом обращении она рендерится не сразу).
-    if (
-      !(await ctrl
-        .waitFor({ state: "visible", timeout: 8000 })
-        .then(() => true, () => false))
-    )
-      return false;
+    await ctrl.waitFor({ state: "visible", timeout: 8000 }).catch(() => {});
     const label = ((await ctrl.textContent().catch(() => "")) || "").trim();
-    if (/Укажите адрес/i.test(label)) return false; // адреса нет — нет и списка
-    for (let i = 0; i < 3; i++) {
-      await ctrl.click({ timeout: 4000 }).catch(() => {});
-      const ok = await page
-        .locator('button:has-text("Куда доставить?")')
+
+    // Активный адрес есть → попап «Куда доставить?».
+    if (label && !/Укажите адрес/i.test(label)) {
+      for (let i = 0; i < 3; i++) {
+        await ctrl.click({ timeout: 4000 }).catch(() => {});
+        const ok = await page
+          .locator('button:has-text("Куда доставить?")')
+          .first()
+          .waitFor({ state: "visible", timeout: 3000 })
+          .then(() => true, () => false);
+        if (ok) {
+          await page.waitForTimeout(700);
+          return true;
+        }
+      }
+    }
+
+    // Активного адреса нет → модалка ввода + фокус на поле (zerosuggest покажет
+    // сохранённые/недавние адреса строками li[role="option"]).
+    if (await this.openAddressModal(page)) {
+      const input = page.locator(SELECTORS.addressInput[0]).first();
+      await input.click().catch(() => {});
+      const appeared = await page
+        .locator('li[role="option"]')
         .first()
-        .waitFor({ state: "visible", timeout: 3000 })
+        .waitFor({ state: "visible", timeout: 5000 })
         .then(() => true, () => false);
-      if (ok) {
-        await page.waitForTimeout(700); // дать отрисоваться списку
+      if (appeared) {
+        await page.waitForTimeout(600);
         return true;
       }
     }
@@ -503,7 +522,7 @@ export class YandexEda {
   private async readSavedItems(page: Page): Promise<SavedAddress[]> {
     return page.evaluate(() => {
       const pop = document.querySelector(
-        '[class*="popup" i],[class*="Popup" i],[role="dialog"]'
+        '[data-testid="desktop-popup"],[class*="popup" i],[class*="Popup" i],[role="dialog"]'
       );
       if (!pop) return [] as any[];
       const out: any[] = [];
@@ -585,20 +604,35 @@ export class YandexEda {
     }
     const best = scored[0].it;
     const needle = best.label || best.address.split(",")[0];
+    // Совпавший элемент — кнопка попапа (активный адрес) ИЛИ строка модалки
+    // li[role="option"] (состояние «нет адреса»).
     await page
       .locator(
-        '[class*="popup" i] button, [class*="Popup" i] button, [role="dialog"] button'
+        '[data-testid="desktop-popup"] button, [class*="popup" i] button, [class*="Popup" i] button, [role="dialog"] button, li[role="option"]'
       )
       .filter({ hasText: needle })
       .first()
       .click({ timeout: 4000 })
       .catch(() => {});
+    await page.waitForTimeout(1500);
+    // Из модалки «Укажите адрес» после выбора может быть экран карты с «Ок».
+    const okBtn = page.locator('button:has-text("Ок"):not([disabled])').first();
+    if (await okBtn.isVisible().catch(() => false)) {
+      await okBtn.click().catch(() => {});
+      await page.waitForTimeout(2000);
+    }
     await page
       .locator('button:has-text("Куда доставить?")')
-      .waitFor({ state: "hidden", timeout: 5000 })
+      .waitFor({ state: "hidden", timeout: 4000 })
       .catch(() => {});
-    await page.waitForTimeout(1500);
+    await page.waitForTimeout(1000);
     const shown = best.label ? `${best.label} — ${best.address}` : best.address;
+    if (!(await this.hasAddress(page))) {
+      return {
+        ok: false,
+        message: `Выбрал «${shown}», но адрес не применился — повтори или уточни.`,
+      };
+    }
     return {
       ok: true,
       message: `Выбран сохранённый адрес: ${shown}`,
@@ -1167,7 +1201,7 @@ export class YandexEda {
       }
       return s.startsWith("/") ? s : "/" + s;
     }
-    // Ищем карточку магазина по имени на главной («Магазины»).
+    // 1) Карточка магазина на главной («Магазины») — быстро, но требует адреса.
     await page.goto(BASE_URL, { waitUntil: "domcontentloaded" });
     await page.waitForTimeout(3000);
     const href = await page.evaluate((q: string) => {
@@ -1178,7 +1212,25 @@ export class YandexEda {
       const m = links.find((a) => norm(a.textContent || "").includes(norm(q)));
       return m ? m.getAttribute("href") : null;
     }, s);
-    return href;
+    if (href) return href;
+
+    // 2) Через поиск заведений (работает и без активного адреса, и для магазинов
+    //    не с главной): находим магазин, открываем его — сайт редиректит на
+    //    retail-страницу, из URL берём brand + placeSlug.
+    const found = await this.searchRestaurants(s, "shop", true).catch(() => []);
+    const shopRes = found[0];
+    if (shopRes?.url || shopRes?.slug) {
+      const target = shopRes.url || `${BASE_URL}/restaurant/${shopRes.slug}`;
+      await page.goto(target, { waitUntil: "domcontentloaded" }).catch(() => {});
+      await page.waitForTimeout(3000);
+      const cur = page.url();
+      if (/\/retail\//.test(cur)) {
+        const u = new URL(cur);
+        const ps = u.searchParams.get("placeSlug");
+        return u.pathname + (ps ? `?placeSlug=${ps}` : "");
+      }
+    }
+    return null;
   }
 
   /** Категории магазина из ответа goods (все, с признаком верхнего уровня). */
