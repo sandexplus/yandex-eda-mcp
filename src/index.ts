@@ -253,6 +253,32 @@ server.registerTool(
   }
 );
 
+server.registerTool(
+  "get_item_options",
+  {
+    title: "Опции блюда",
+    description:
+      "Возвращает группы обязательных/дополнительных опций блюда (вкус, размер, " +
+      "гарнир, добавки) с вариантами и ценами. Вызывай для позиций с `hasOptions` " +
+      "ПЕРЕД add_to_cart: покажи варианты пользователю (или выбери) и передай нужные " +
+      "в add_to_cart через `options`. Обязательные группы помечены `required: true`.",
+    inputSchema: {
+      restaurant: z.string().describe("URL или slug ресторана"),
+      item: z.string().describe("Название блюда (как в get_menu)"),
+    },
+  },
+  async ({ restaurant, item }) => {
+    const res = await eda.getItemOptions(restaurant, item);
+    if (!res.item) {
+      return fail(`Блюдо «${item}» не найдено в меню «${res.restaurant}».`);
+    }
+    if (!res.groups.length) {
+      return ok(`У «${res.item}» нет опций — можно добавлять сразу (add_to_cart).`);
+    }
+    return json({ restaurant: res.restaurant, item: res.item, optionGroups: res.groups });
+  }
+);
+
 // --- Корзина и заказ -------------------------------------------------------
 server.registerTool(
   "add_to_cart",
@@ -261,8 +287,9 @@ server.registerTool(
     description:
       "Добавляет позицию в корзину по названию (сначала get_menu на нужном ресторане). " +
       "Меню подгружается лениво — инструмент сам прокручивает страницу до позиции. " +
-      "Если у блюда `hasOptions` (вкус/размер/добавки) — передай выбор в `options`, " +
-      "например options: [\"Острый\"]; иначе кнопка добавления будет заблокирована.",
+      "Если у блюда `hasOptions` — СНАЧАЛА вызови get_item_options, чтобы узнать точные " +
+      "варианты, и передай выбранные в `options` (значения должны совпадать с вариантами " +
+      "из get_item_options). Без обязательных опций кнопка добавления заблокирована.",
     inputSchema: {
       item: z.string().describe("Название блюда как в меню (get_menu)"),
       quantity: z.number().int().min(1).max(20).optional().default(1),
@@ -271,7 +298,7 @@ server.registerTool(
         .optional()
         .default([])
         .describe(
-          "Обязательные опции блюда по тексту: вкус/размер/добавки (напр. [\"Острый\", \"Большой\"])"
+          "Выбранные опции — тексты вариантов из get_item_options (напр. [\"Воппер Беконез\"])"
         ),
     },
   },

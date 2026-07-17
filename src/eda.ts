@@ -182,6 +182,16 @@ export interface MenuItem {
   raw?: unknown;
 }
 
+/** Группа опций блюда (вкус/размер/добавки) с вариантами выбора. */
+export interface OptionGroup {
+  name: string;
+  /** Обязательна ли группа (нужно выбрать хотя бы один вариант). */
+  required: boolean;
+  min?: number;
+  max?: number;
+  options: { name: string; price?: number | string }[];
+}
+
 /** Сохранённый адрес доставки из аккаунта (метка + строка адреса). */
 export interface SavedAddress {
   /** «Дом», «На работу» и т.п., если у адреса задана метка. */
@@ -885,6 +895,49 @@ export class YandexEda {
     return { restaurant: restaurant.trim(), items };
   }
 
+  /** Разбирает optionsGroups блюда из API в удобный вид. */
+  private parseOptionGroups(raw: any): OptionGroup[] {
+    if (!Array.isArray(raw)) return [];
+    return raw
+      .map((g: any) => ({
+        name: textVal(g?.name) || "",
+        required: !!(g?.required ?? g?.isRequired ?? g?.mandatory),
+        min: g?.minSelected ?? g?.minSelectedOptions ?? g?.min,
+        max: g?.maxSelected ?? g?.maxSelectedOptions ?? g?.max,
+        options: (g?.options || g?.items || [])
+          .map((o: any) => ({
+            name: textVal(o?.name) || "",
+            price: o?.price ?? o?.decimalPrice ?? undefined,
+          }))
+          .filter((o: any) => o.name),
+      }))
+      .filter((g: OptionGroup) => g.options.length);
+  }
+
+  /**
+   * Возвращает группы опций конкретного блюда (вкус/размер/добавки с вариантами),
+   * чтобы агент показал выбор пользователю и передал нужный вариант в add_to_cart.
+   * Читает из API меню — надёжно, без клика по карточке.
+   */
+  async getItemOptions(
+    restaurantUrlOrSlug: string,
+    itemName: string
+  ): Promise<{ restaurant: string; item: string | null; groups: OptionGroup[] }> {
+    const { restaurant, items } = await this.getMenu(restaurantUrlOrSlug);
+    const norm = (s: string) => s.toLowerCase().replace(/ё/g, "е").trim();
+    const q = norm(itemName);
+    const item =
+      items.find((i) => norm(i.name) === q) ||
+      items.find((i) => norm(i.name).includes(q)) ||
+      items.find((i) => q.includes(norm(i.name)));
+    if (!item) return { restaurant, item: null, groups: [] };
+    return {
+      restaurant,
+      item: item.name,
+      groups: this.parseOptionGroups((item.raw as any)?.optionsGroups),
+    };
+  }
+
   private parseMenuFromApi(bodies: unknown[]): MenuItem[] {
     const out: MenuItem[] = [];
     const seen = new Set<string>();
@@ -1062,9 +1115,9 @@ export class YandexEda {
       return {
         ok: false,
         message:
-          `«${itemName}» требует выбора обязательных опций (вкус/размер/добавки), ` +
-          `подобрать автоматически не вышло. Уточни у пользователя вариант и передай его в options ` +
-          `(например options: ["Острый"]).`,
+          `«${itemName}» требует выбора обязательных опций (вкус/размер/добавки). ` +
+          `Вызови get_item_options для этого блюда, чтобы увидеть точные варианты, ` +
+          `затем add_to_cart с options: [...] (например options: ["Воппер Беконез"]).`,
       };
     }
     await addBtn.click().catch(() => {});
