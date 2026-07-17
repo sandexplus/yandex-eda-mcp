@@ -420,10 +420,18 @@ export class YandexEda {
   async getCurrentAddress(): Promise<string | null> {
     const page = await this.page();
     await this.ensureOnSite(page);
-    if (!(await this.hasAddress(page))) return null;
+    // Даём шапке дорисоваться, иначе можно прочитать промежуточное состояние.
+    await page
+      .locator("header button")
+      .first()
+      .waitFor({ state: "visible", timeout: 6000 })
+      .catch(() => {});
+    await page.waitForTimeout(600);
     const ctrl = this.addressControl(page);
     const txt = ((await ctrl.textContent().catch(() => "")) || "").trim();
-    return txt || null;
+    // «Укажите адрес» — это НЕ адрес, а приглашение его задать.
+    if (!txt || /Укажите адрес/i.test(txt)) return null;
+    return txt;
   }
 
   /** Открывает попап со списком сохранённых адресов (нужен активный адрес). */

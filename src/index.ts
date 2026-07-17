@@ -16,6 +16,26 @@ const server = new McpServer({
   version: "0.1.0",
 });
 
+// Сериализуем ВСЕ вызовы инструментов: MCP-клиент может слать их параллельно,
+// а браузер/контекст один. Без сериализации операции затирают друг друга —
+// гонки навигации, «Target page/context closed», ложный «Укажите адрес» и
+// ложный ре-логин. Оборачиваем registerTool так, чтобы каждый обработчик
+// выполнялся строго после предыдущего (по цепочке промисов).
+let opChain: Promise<unknown> = Promise.resolve();
+const _registerTool = server.registerTool.bind(server) as any;
+(server as any).registerTool = (name: string, config: any, handler: any) =>
+  _registerTool(name, config, (...args: any[]) => {
+    const run = opChain.then(
+      () => handler(...args),
+      () => handler(...args)
+    );
+    opChain = run.then(
+      () => {},
+      () => {}
+    );
+    return run;
+  });
+
 function ok(text: string) {
   return { content: [{ type: "text" as const, text }] };
 }
