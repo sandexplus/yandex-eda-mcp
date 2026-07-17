@@ -175,6 +175,10 @@ export interface MenuItem {
   description?: string;
   weight?: string;
   id?: string | number;
+  /** Категория меню, к которой относится позиция. */
+  category?: string;
+  /** Требует выбора обязательных опций (вкус/размер/добавки) при добавлении. */
+  hasOptions?: boolean;
   raw?: unknown;
 }
 
@@ -854,19 +858,26 @@ export class YandexEda {
   private parseMenuFromApi(bodies: unknown[]): MenuItem[] {
     const out: MenuItem[] = [];
     const seen = new Set<string>();
-    const push = (it: any) => {
+    const push = (it: any, category?: string) => {
       const price = it?.price ?? it?.decimalPrice ?? it?.decimal_price ?? it?.cost;
       const name = textVal(it?.name ?? it?.title);
       if (!name || price == null) return;
       const key = String(it.id ?? it.publicId ?? name);
       if (seen.has(key)) return;
       seen.add(key);
+      const groups =
+        it.optionsGroups ?? it.optionGroups ?? it.option_groups ?? it.options;
       out.push({
         name,
         price,
         description: textVal(it.description ?? it.shortDescription),
         weight: it.weight ?? it.measure,
         id: it.id ?? it.publicId,
+        category,
+        hasOptions:
+          (Array.isArray(groups) && groups.length > 0) ||
+          it.has_required_option_groups === true ||
+          undefined,
         raw: it,
       });
     };
@@ -876,7 +887,9 @@ export class YandexEda {
       const cats = body?.payload?.categories ?? body?.categories;
       if (!Array.isArray(cats)) continue;
       const collect = (cat: any) => {
-        if (Array.isArray(cat?.items)) cat.items.forEach(push);
+        const catName = textVal(cat?.name);
+        if (Array.isArray(cat?.items))
+          cat.items.forEach((it: any) => push(it, catName));
         if (Array.isArray(cat?.categories)) cat.categories.forEach(collect);
       };
       cats.forEach(collect);
@@ -900,44 +913,134 @@ export class YandexEda {
   }
 
   /**
-   * Добавляет позицию в корзину по названию. Открывает карточку товара,
-   * если требуется, и жмёт «Добавить».
+   * Находит карточку блюда по названию, прокручивая меню — сайт подгружает
+   * позиции лениво, по мере прокрутки до их категории.
+   */
+  private async findMenuItemCard(page: Page, itemName: string) {
+    const sel = '[data-testid="product-card-v2-root"]';
+    const byName = () => page.locator(sel).filter({ hasText: itemName }).first();
+    for (let step = 0; step < 20; step++) {
+      if (await byName().count()) return byName();
+      const atBottom = await page.evaluate(() => {
+        const y = window.scrollY;
+        window.scrollBy(0, 1100);
+        return window.scrollY === y;
+      });
+      await page.waitForTimeout(500);
+      if (atBottom) break;
+    }
+    return (await byName().count()) ? byName() : null;
+  }
+
+  /**
+   * Добавляет позицию в корзину по названию (должна быть открыта страница
+   * ресторана — сначала get_menu). Простые позиции добавляет счётчиком на
+   * карточке; позиции с обязательными опциями открывает и выбирает переданные
+   * `options` (напр. ["Острый"]).
    */
   async addToCart(
     itemName: string,
-    quantity = 1
+    quantity = 1,
+    options: string[] = []
   ): Promise<{ ok: boolean; message: string }> {
     const page = await this.page();
-    // Ищем блок товара по тексту названия.
-    const item = page
-      .locator(`text=${itemName}`)
-      .first();
-    try {
-      await item.scrollIntoViewIfNeeded({ timeout: 5000 });
-    } catch {
+    const card = await this.findMenuItemCard(page, itemName);
+    if (!card) {
       return {
         ok: false,
-        message: `Позиция «${itemName}» не найдена на странице. Сначала откройте нужный ресторан через get_menu.`,
+        message: `Позиция «${itemName}» не найдена в меню даже после прокрутки. Проверьте, что открыт нужный ресторан (get_menu) и название совпадает.`,
       };
     }
+    await card.scrollIntoViewIfNeeded().catch(() => {});
 
-    // Кнопка "Добавить" рядом с товаром либо внутри его карточки.
-    const container = item.locator(
-      "xpath=ancestor-or-self::*[self::article or self::li or self::div][1]"
-    );
-    let addBtn = container.locator(SELECTORS.addItemButton.join(", ")).first();
-    if (!(await addBtn.count())) {
-      await item.click().catch(() => {});
-      addBtn = (await firstVisible(page, SELECTORS.addItemButton, 4000)) ?? addBtn;
+    // Простой случай: опции не заданы и на карточке есть счётчик «+».
+    const plus = card
+      .locator('[data-testid="product-card-v2-counter-increase-btn"]')
+      .first();
+    if (!options.length && (await plus.count())) {
+      await plus.click().catch(() => {});
+      await page.waitForTimeout(900);
+      const modalOpened = await page
+        .locator('[data-testid="product-full-card-name"]')
+        .isVisible()
+        .catch(() => false);
+      if (!modalOpened) {
+        // Добавилось прямо на карточке — докликиваем нужное количество.
+        for (let i = 1; i < quantity; i++) {
+          await plus.click().catch(() => {});
+          await page.waitForTimeout(400);
+        }
+        return { ok: true, message: `Добавлено: ${itemName} ×${quantity}` };
+      }
+      // Иначе открылась карточка товара (нужны опции) — обрабатываем ниже.
+    } else {
+      await card.click().catch(() => {});
+      await page.waitForTimeout(1500);
     }
-    if (!(await addBtn.count())) {
-      return { ok: false, message: "Кнопка «Добавить» не найдена." };
+
+    return this.addFromItemModal(page, itemName, quantity, options);
+  }
+
+  /** Добавляет из открытой карточки товара: выбор опций, количество, «Добавить». */
+  private async addFromItemModal(
+    page: Page,
+    itemName: string,
+    quantity: number,
+    options: string[]
+  ): Promise<{ ok: boolean; message: string }> {
+    const nameVisible = await page
+      .locator('[data-testid="product-full-card-name"]')
+      .isVisible()
+      .catch(() => false);
+    if (!nameVisible) {
+      return { ok: false, message: `Не удалось открыть карточку «${itemName}».` };
     }
-    for (let i = 0; i < quantity; i++) {
-      await addBtn.click();
-      await page.waitForTimeout(400);
+    const modal = page
+      .locator('[data-testid="desktop-popup"], [role="dialog"]')
+      .first();
+    // Кнопка «Добавить» (по тексту/по testid); активность — по isEnabled.
+    const addBtn = modal
+      .locator(
+        '[data-testid="product-full-card-add-to-cart"], button:has-text("Добавить")'
+      )
+      .first();
+    const ready = async () =>
+      (await addBtn.count()) > 0 &&
+      (await addBtn.isEnabled().catch(() => false));
+
+    // Выбираем переданные опции по тексту (напр. «Воппер Беконез», «Большой»).
+    // Опция — ряд с radio/checkbox; кликаем по самому тексту (Playwright попадёт
+    // в нужный элемент, а не в скрытый input).
+    for (const opt of options) {
+      const byText = modal.getByText(opt, { exact: false }).first();
+      if (await byText.count()) {
+        await byText.scrollIntoViewIfNeeded().catch(() => {});
+        await byText.click().catch(() => {});
+        await page.waitForTimeout(500);
+      }
     }
-    return { ok: true, message: `Добавлено в корзину: ${itemName} ×${quantity}` };
+
+    // Количество (+ в карточке товара).
+    const inc = modal.locator('[data-testid="amount-select-increment"]').first();
+    for (let i = 1; i < quantity; i++) {
+      if (await inc.count()) await inc.click().catch(() => {});
+      await page.waitForTimeout(300);
+    }
+
+    if (!(await ready())) {
+      await page.keyboard.press("Escape").catch(() => {});
+      return {
+        ok: false,
+        message:
+          `«${itemName}» требует выбора обязательных опций (вкус/размер/добавки), ` +
+          `подобрать автоматически не вышло. Уточни у пользователя вариант и передай его в options ` +
+          `(например options: ["Острый"]).`,
+      };
+    }
+    await addBtn.click().catch(() => {});
+    await page.waitForTimeout(1200);
+    const optNote = options.length ? ` (${options.join(", ")})` : "";
+    return { ok: true, message: `Добавлено: ${itemName} ×${quantity}${optNote}` };
   }
 
   /** Читает состав корзины. */

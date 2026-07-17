@@ -215,6 +215,9 @@ server.registerTool(
         name: i.name,
         price: i.price,
         weight: i.weight,
+        category: i.category,
+        // Позиции с опциями требуют выбора вкуса/размера при add_to_cart (options).
+        hasOptions: i.hasOptions,
         description: i.description,
       })),
     });
@@ -227,15 +230,24 @@ server.registerTool(
   {
     title: "Добавить в корзину",
     description:
-      "Добавляет позицию в корзину по названию. Должна быть открыта страница нужного " +
-      "ресторана (сначала вызовите get_menu).",
+      "Добавляет позицию в корзину по названию (сначала get_menu на нужном ресторане). " +
+      "Меню подгружается лениво — инструмент сам прокручивает страницу до позиции. " +
+      "Если у блюда `hasOptions` (вкус/размер/добавки) — передай выбор в `options`, " +
+      "например options: [\"Острый\"]; иначе кнопка добавления будет заблокирована.",
     inputSchema: {
-      item: z.string().describe("Название блюда как в меню"),
+      item: z.string().describe("Название блюда как в меню (get_menu)"),
       quantity: z.number().int().min(1).max(20).optional().default(1),
+      options: z
+        .array(z.string())
+        .optional()
+        .default([])
+        .describe(
+          "Обязательные опции блюда по тексту: вкус/размер/добавки (напр. [\"Острый\", \"Большой\"])"
+        ),
     },
   },
-  async ({ item, quantity }) => {
-    const res = await eda.addToCart(item, quantity);
+  async ({ item, quantity, options }) => {
+    const res = await eda.addToCart(item, quantity, options);
     return res.ok ? ok(res.message) : fail(res.message);
   }
 );
