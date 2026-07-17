@@ -1386,6 +1386,90 @@ export class YandexEda {
   }
 
   /**
+   * Добавляет товар МАГАЗИНА в корзину. У retail карточка иная, чем у ресторана
+   * (product-card-root), и товар рендерится через поиск — поэтому отдельный путь:
+   * открываем магазин с поиском товара, находим карточку по названию и жмём «+»
+   * (amount-select-increment, aria «В корзину»).
+   */
+  async addShopProduct(
+    shop: string,
+    product: string,
+    quantity = 1
+  ): Promise<{ ok: boolean; message: string }> {
+    await this.ensureLoggedIn();
+    const page = await this.page();
+    const path = await this.resolveShopPath(page, shop);
+    if (!path) {
+      return { ok: false, message: `Магазин «${shop}» не найден. Уточни название.` };
+    }
+    const brand = (path.match(/\/retail\/([^/?]+)/) || [])[1] || "";
+    const placeSlug = (path.match(/placeSlug=([^&]+)/) || [])[1] || "";
+    await page
+      .goto(
+        `${BASE_URL}/retail/${brand}?placeSlug=${placeSlug}&query=${encodeURIComponent(
+          product
+        )}`,
+        { waitUntil: "domcontentloaded" }
+      )
+      .catch(() => {});
+    await page.waitForTimeout(3800);
+
+    const norm = (s?: string | null) =>
+      (s || "").toLowerCase().replace(/ё/g, "е").trim();
+    // Значимые слова запроса (без веса/процентов) для строгого совпадения.
+    const qWords = norm(product)
+      .split(/[\s,]+/)
+      .filter((w) => w.length >= 3 && !/^\d/.test(w) && !/^вес$/.test(w));
+    const cards = page.locator('[data-testid="product-card-root"]');
+    const n = Math.min(await cards.count(), 40);
+
+    let target: Locator | null = null;
+    let matchedName = "";
+    for (let i = 0; i < n; i++) {
+      const nm =
+        (await cards
+          .nth(i)
+          .locator('[data-testid="product-card-name"]')
+          .first()
+          .textContent()
+          .catch(() => "")) || "";
+      const nn = norm(nm);
+      // Требуем, чтобы совпали ВСЕ значимые слова запроса — иначе не тот товар.
+      if (qWords.length && qWords.every((w) => nn.includes(w))) {
+        target = cards.nth(i);
+        matchedName = nm.trim();
+        break;
+      }
+    }
+    if (!target) {
+      return {
+        ok: false,
+        message:
+          `Точную карточку «${product}» на странице «${shop}» не нашёл — ` +
+          `Яндекс.Еда в этом режиме часто рендерит витрину-промо вместо результатов поиска, ` +
+          `и добавить произвольный товар магазина программно удаётся не всегда. ` +
+          `Покажи пользователю найденное через search_products, а товары магазина ему, ` +
+          `возможно, придётся добавить в приложении.`,
+      };
+    }
+    await target.scrollIntoViewIfNeeded().catch(() => {});
+    const plus = target
+      .locator('[data-testid="amount-select-increment"]')
+      .first();
+    if (!(await plus.count())) {
+      return {
+        ok: false,
+        message: `Кнопка «+» у «${matchedName}» не найдена (нет в наличии?).`,
+      };
+    }
+    for (let k = 0; k < quantity; k++) {
+      await plus.click().catch(() => {});
+      await page.waitForTimeout(700);
+    }
+    return { ok: true, message: `Добавлено в корзину: ${matchedName} ×${quantity}` };
+  }
+
+  /**
    * Открывает корзину, чтобы подгрузился full-carts и появилась панель с
    * «Очистить». Принудительно грузим главную (иначе на устаревшей странице
    * кнопки корзины может не быть), затем открываем drawer кликом по «Корзина»
