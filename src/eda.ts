@@ -182,6 +182,17 @@ export interface MenuItem {
   raw?: unknown;
 }
 
+/** Товар магазина (retail). */
+export interface ShopProduct {
+  name: string;
+  price?: number | string;
+  /** Цена по акции/скидке, если есть. */
+  promoPrice?: number | string;
+  weight?: string;
+  inStock?: boolean;
+  description?: string;
+}
+
 /** Позиция в корзине (с количеством и выбранными опциями). */
 export interface CartItem {
   name: string;
@@ -1142,6 +1153,184 @@ export class YandexEda {
     await page.waitForTimeout(1200);
     const optNote = options.length ? ` (${options.join(", ")})` : "";
     return { ok: true, message: `Добавлено: ${itemName} ×${quantity}${optNote}` };
+  }
+
+  // --- Магазины (retail) -----------------------------------------------------
+
+  /** Резолвит магазин (имя/slug/retail-путь) в путь `/retail/{brand}?placeSlug=...`. */
+  private async resolveShopPath(page: Page, shop: string): Promise<string | null> {
+    const s = shop.trim();
+    if (/\/retail\//.test(s)) {
+      if (s.startsWith("http")) {
+        const u = new URL(s);
+        return u.pathname + u.search;
+      }
+      return s.startsWith("/") ? s : "/" + s;
+    }
+    // Ищем карточку магазина по имени на главной («Магазины»).
+    await page.goto(BASE_URL, { waitUntil: "domcontentloaded" });
+    await page.waitForTimeout(3000);
+    const href = await page.evaluate((q: string) => {
+      const norm = (x: string) => x.toLowerCase().replace(/ё/g, "е");
+      const links = [...document.querySelectorAll('a[href*="/retail/"]')].filter(
+        (a) => !/\/d\//.test(a.getAttribute("href") || "")
+      );
+      const m = links.find((a) => norm(a.textContent || "").includes(norm(q)));
+      return m ? m.getAttribute("href") : null;
+    }, s);
+    return href;
+  }
+
+  /** Категории магазина из ответа goods (все, с признаком верхнего уровня). */
+  private parseShopCategories(
+    bodies: unknown[]
+  ): { name: string; id: string | number; top: boolean }[] {
+    const out: { name: string; id: string | number; top: boolean }[] = [];
+    const seen = new Set<string>();
+    for (const b of bodies as any[]) {
+      const cats = b?.payload?.categories;
+      if (!Array.isArray(cats)) continue;
+      for (const c of cats) {
+        const name = textVal(c?.name);
+        if (!name || c?.id == null || seen.has(name)) continue;
+        seen.add(name);
+        out.push({ name, id: c.id, top: !c.parentId });
+      }
+    }
+    return out;
+  }
+
+  /** Товары из ответов магазина (search: blocks[].payload.products; goods: categories[].items). */
+  private parseProducts(bodies: unknown[]): ShopProduct[] {
+    const out: ShopProduct[] = [];
+    const seen = new Set<string>();
+    const push = (p: any) => {
+      const name = textVal(p?.name);
+      const price = p?.price ?? p?.decimalPrice;
+      if (!name || price == null) return;
+      // У retail-товаров `id` часто 0 (неуникален) — дедупим по public_id/uid.
+      const key = String(p.public_id ?? p.uid ?? p.id ?? name);
+      if (seen.has(key)) return;
+      seen.add(key);
+      out.push({
+        name,
+        price,
+        promoPrice: p.promoPrice ?? p.decimalPromoPrice ?? undefined,
+        weight: p.weight ?? p.measure,
+        inStock: p.inStock ?? p.available,
+        description: textVal(p.description) || undefined,
+      });
+    };
+    const walk = (node: any, depth = 0) => {
+      if (!node || depth > 10) return;
+      if (Array.isArray(node)) return node.forEach((n) => walk(n, depth + 1));
+      if (typeof node === "object") {
+        const price = node.price ?? node.decimalPrice;
+        if (node.name && price != null && !Array.isArray(node.items)) push(node);
+        for (const k of ["products", "items", "payload", "blocks", "categories", "data", "result"]) {
+          if (node[k]) walk(node[k], depth + 1);
+        }
+      }
+    };
+    bodies.forEach((b) => walk(b));
+    return out;
+  }
+
+  /**
+   * Работа с магазином (retail). Без query/category — отдаёт список категорий;
+   * с query — ищет товары по запросу; с category — товары этой категории.
+   * `shop` — имя («Пятёрочка»), slug или retail-путь.
+   */
+  async searchProducts(
+    shop: string,
+    query?: string,
+    category?: string
+  ): Promise<{
+    shop: string;
+    mode: "search" | "category" | "categories";
+    categories?: string[];
+    products?: ShopProduct[];
+    note?: string;
+  }> {
+    await this.ensureLoggedIn();
+    const page = await this.page();
+    const path = await this.resolveShopPath(page, shop);
+    if (!path) {
+      return {
+        shop,
+        mode: "categories",
+        categories: [],
+        note: `Магазин «${shop}» не найден на главной. Уточни название (Пятёрочка, Магнит, Лента…) или передай его retail-URL.`,
+      };
+    }
+    const brand = (path.match(/\/retail\/([^/?]+)/) || [])[1] || "";
+    const placeSlug = (path.match(/placeSlug=([^&]+)/) || [])[1] || "";
+    const shopUrl = `${BASE_URL}/retail/${brand}?placeSlug=${placeSlug}`;
+
+    // Поиск по запросу.
+    if (query && query.trim()) {
+      const q = query.trim();
+      const bodies = await collectJson(
+        page,
+        /\/api\/v\d+\/menu\/search/,
+        async () => {
+          await page.goto(`${shopUrl}&query=${encodeURIComponent(q)}`, {
+            waitUntil: "domcontentloaded",
+          });
+          await page.waitForTimeout(3500);
+        },
+        2500
+      );
+      return { shop, mode: "search", products: this.parseProducts(bodies) };
+    }
+
+    // Категории (для отдачи или резолва).
+    const catBodies = await collectJson(
+      page,
+      /\/api\/v2\/menu\/goods/,
+      async () => {
+        await page.goto(shopUrl, { waitUntil: "domcontentloaded" });
+        await page.waitForTimeout(4000);
+      },
+      2500
+    );
+    const cats = this.parseShopCategories(catBodies);
+    const topCats = cats.filter((c) => c.top);
+    const displayNames = (topCats.length ? topCats : cats).map((c) => c.name);
+
+    // Просмотр конкретной категории (резолвим по ВСЕМ категориям, включая под-).
+    if (category && category.trim()) {
+      const norm = (x: string) => x.toLowerCase().replace(/ё/g, "е");
+      const cat =
+        cats.find((c) => norm(c.name) === norm(category)) ||
+        cats.find((c) => norm(c.name).includes(norm(category))) ||
+        cats.find((c) => norm(category).includes(norm(c.name)));
+      if (!cat) {
+        return {
+          shop,
+          mode: "category",
+          categories: displayNames,
+          products: [],
+          note: `Категория «${category}» не найдена. Выбери из списка categories.`,
+        };
+      }
+      const bodies = await collectJson(
+        page,
+        /\/api\/v2\/menu\/goods/,
+        async () => {
+          await page.goto(
+            `${BASE_URL}/retail/${brand}/catalog/${cat.id}?placeSlug=${placeSlug}`,
+            { waitUntil: "domcontentloaded" }
+          );
+          await page.waitForTimeout(4000);
+        },
+        2500
+      );
+      return { shop, mode: "category", products: this.parseProducts(bodies) };
+    }
+
+    // Ни query, ни category — отдаём список категорий (верхний уровень).
+    return { shop, mode: "categories", categories: displayNames };
   }
 
   /**

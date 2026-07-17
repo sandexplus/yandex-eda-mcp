@@ -299,6 +299,54 @@ server.registerTool(
   }
 );
 
+// --- Магазины (retail) -----------------------------------------------------
+server.registerTool(
+  "search_products",
+  {
+    title: "Товары в магазине",
+    description:
+      "Работа с МАГАЗИНОМ (Пятёрочка, Магнит, Лента, Лавка…) — в отличие от ресторанов, " +
+      "у магазина тысячи товаров, поэтому меню не выгружают целиком, а ищут/смотрят по " +
+      "категориям:\n" +
+      "• без `query` и `category` → список категорий магазина (посмотреть, что есть);\n" +
+      "• `query` (напр. «молоко 3.2») → поиск товаров по запросу — ГЛАВНЫЙ путь для " +
+      "«добавь X из магазина»;\n" +
+      "• `category` (из списка категорий) → товары этой категории.\n" +
+      "Возвращает товары с ценой, ценой по акции (promoPrice), весом и наличием (inStock). " +
+      "Требуется заданный адрес. Магазин задаётся именем.",
+    inputSchema: {
+      shop: z
+        .string()
+        .describe("Магазин: имя («Пятёрочка», «Магнит»), slug или retail-URL"),
+      query: z
+        .string()
+        .optional()
+        .describe("Что искать среди товаров (напр. «молоко 3.2», «хлеб бородинский»)"),
+      category: z
+        .string()
+        .optional()
+        .describe("Название категории из списка (для просмотра её товаров)"),
+      limit: z.number().int().min(1).max(60).optional().default(25),
+    },
+  },
+  async ({ shop, query, category, limit }) => {
+    const res = await eda.searchProducts(shop, query, category);
+    if (res.mode === "categories") {
+      if (!res.categories?.length)
+        return fail(res.note || `Категории магазина «${shop}» не получены.`);
+      return json({ shop: res.shop, categories: res.categories.slice(0, 60) });
+    }
+    const products = (res.products || []).slice(0, limit);
+    if (!products.length) {
+      return fail(
+        res.note ||
+          `В «${res.shop}» ничего не нашёл${query ? ` по «${query}»` : ""}. Проверь адрес (set_address) и название.`
+      );
+    }
+    return json({ shop: res.shop, mode: res.mode, count: products.length, products });
+  }
+);
+
 // --- Корзина и заказ -------------------------------------------------------
 server.registerTool(
   "add_to_cart",
