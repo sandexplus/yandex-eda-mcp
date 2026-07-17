@@ -1503,36 +1503,71 @@ export class YandexEda {
       };
     }
     await target.scrollIntoViewIfNeeded().catch(() => {});
+
+    // Основной путь: открыть детальную карточку — там надёжная кнопка «Добавить»
+    // (product-full-card-add-to-cart). Модалка капризна → до 5 попыток открыть.
+    let modalOpen = false;
+    for (let attempt = 0; attempt < 5 && !modalOpen; attempt++) {
+      await target.click().catch(() => {});
+      modalOpen = await page
+        .locator('[data-testid="product-full-card-name"]')
+        .first()
+        .waitFor({ state: "visible", timeout: 2500 })
+        .then(() => true, () => false);
+      if (!modalOpen) {
+        await page.keyboard.press("Escape").catch(() => {});
+        await page.waitForTimeout(700);
+      }
+    }
+    if (modalOpen) {
+      const inc = page.locator('[data-testid="amount-select-increment"]').first();
+      for (let i = 1; i < quantity; i++) {
+        if (await inc.count()) await inc.click().catch(() => {});
+        await page.waitForTimeout(400);
+      }
+      const addBtn = page
+        .locator('[data-testid="product-full-card-add-to-cart"]')
+        .first();
+      if ((await addBtn.count()) && (await addBtn.isEnabled().catch(() => false))) {
+        await addBtn.click().catch(() => {});
+        await page.waitForTimeout(1800);
+        return {
+          ok: true,
+          message: `Добавлено в корзину: ${matchedName} ×${quantity}`,
+        };
+      }
+      await page.keyboard.press("Escape").catch(() => {});
+    }
+
+    // Фолбэк: счётчик «+» прямо на карточке.
     const plus = target
       .locator('[data-testid="amount-select-increment"]')
       .first();
-    if (!(await plus.count())) {
-      return {
-        ok: false,
-        message: `Кнопка «+» у «${matchedName}» не найдена (нет в наличии?).`,
-      };
+    if (await plus.count()) {
+      for (let k = 0; k < quantity; k++) {
+        await plus.click().catch(() => {});
+        await page.waitForTimeout(700);
+      }
+      const added = await target
+        .locator('[data-testid="amount-select-decrement"]')
+        .first()
+        .isVisible()
+        .catch(() => false);
+      if (added) {
+        return {
+          ok: true,
+          message: `Добавлено в корзину: ${matchedName} ×${quantity}`,
+        };
+      }
     }
-    for (let k = 0; k < quantity; k++) {
-      await plus.click().catch(() => {});
-      await page.waitForTimeout(700);
-    }
-    // ЧЕСТНАЯ проверка: после добавления на карточке появляется счётчик (кнопка
-    // «−»). Если его нет — клик не сработал (retail-витрина капризна), не врём.
-    const added = await target
-      .locator('[data-testid="amount-select-decrement"], [data-testid*="counter-count"]')
-      .first()
-      .isVisible()
-      .catch(() => false);
-    if (!added) {
-      return {
-        ok: false,
-        message:
-          `Не удалось подтвердить добавление «${matchedName}» — Яндекс.Еда в headless-режиме ` +
-          `нестабильно кладёт товары магазина в корзину. Покажи пользователю список через ` +
-          `search_products; товар из магазина, возможно, надёжнее добавить в приложении.`,
-      };
-    }
-    return { ok: true, message: `Добавлено в корзину: ${matchedName} ×${quantity}` };
+
+    return {
+      ok: false,
+      message:
+        `«${matchedName}»: карточка/корзина не отозвались после нескольких попыток ` +
+        `(retail Яндекс.Еды капризен в headless). Покажи список через search_products; ` +
+        `товар из магазина, возможно, надёжнее добавить в приложении.`,
+    };
   }
 
   /**
