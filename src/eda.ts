@@ -1516,6 +1516,22 @@ export class YandexEda {
       await plus.click().catch(() => {});
       await page.waitForTimeout(700);
     }
+    // ЧЕСТНАЯ проверка: после добавления на карточке появляется счётчик (кнопка
+    // «−»). Если его нет — клик не сработал (retail-витрина капризна), не врём.
+    const added = await target
+      .locator('[data-testid="amount-select-decrement"], [data-testid*="counter-count"]')
+      .first()
+      .isVisible()
+      .catch(() => false);
+    if (!added) {
+      return {
+        ok: false,
+        message:
+          `Не удалось подтвердить добавление «${matchedName}» — Яндекс.Еда в headless-режиме ` +
+          `нестабильно кладёт товары магазина в корзину. Покажи пользователю список через ` +
+          `search_products; товар из магазина, возможно, надёжнее добавить в приложении.`,
+      };
+    }
     return { ok: true, message: `Добавлено в корзину: ${matchedName} ×${quantity}` };
   }
 
