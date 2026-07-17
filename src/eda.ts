@@ -1,4 +1,4 @@
-import type { Page, Response, BrowserContext } from "playwright";
+import type { Page, Response, BrowserContext, Locator } from "playwright";
 import fs from "node:fs";
 import path from "node:path";
 import { browserManager } from "./browser.js";
@@ -1166,6 +1166,24 @@ export class YandexEda {
     }
   }
 
+  /** Собирает названия выбранных опций позиции корзины (рекурсивно). */
+  private flattenCartOptions(raw: any): string[] | undefined {
+    const out: string[] = [];
+    const walk = (o: any, depth = 0) => {
+      if (!o || depth > 5) return;
+      if (Array.isArray(o)) return o.forEach((x) => walk(x, depth + 1));
+      if (typeof o === "object") {
+        const n = textVal(o.name);
+        if (n) out.push(n);
+        for (const k of ["options", "modifiers", "group_options", "items"]) {
+          if (o[k]) walk(o[k], depth + 1);
+        }
+      }
+    };
+    walk(raw);
+    return out.length ? [...new Set(out)] : undefined;
+  }
+
   /** Разбирает корзину из ответа full-carts (`cart.items[]`). */
   private parseCart(bodies: unknown[]): {
     items: CartItem[];
@@ -1183,11 +1201,7 @@ export class YandexEda {
           quantity: it?.quantity ?? it?.count,
           price: it?.price ?? it?.decimal_price,
           subtotal: it?.subtotal,
-          options: Array.isArray(it?.item_options)
-            ? it.item_options
-                .map((o: any) => textVal(o?.name) || textVal(o))
-                .filter(Boolean)
-            : undefined,
+          options: this.flattenCartOptions(it?.item_options),
         }));
         return {
           items,
@@ -1273,6 +1287,115 @@ export class YandexEda {
         ? `Корзина очищена (удалено корзин: ${removed}).`
         : "Корзина уже пуста.",
     };
+  }
+
+  /**
+   * Точечно удаляет из корзины одну позицию по названию (и, если задано, по
+   * опциям — одно и то же блюдо может быть в корзине в нескольких вариантах с
+   * разными опциями). Уменьшает счётчик строки в панели корзины до нуля.
+   */
+  async removeFromCart(
+    itemName: string,
+    options: string[] = []
+  ): Promise<{ ok: boolean; message: string }> {
+    await this.ensureLoggedIn();
+    const page = await this.page();
+    const bodies = await collectJson(
+      page,
+      /cart\/v\d+\/full-carts/,
+      async () => {
+        await this.openCart(page);
+      },
+      2000
+    );
+    const cart = this.parseCart(bodies);
+    if (!cart.items.length) return { ok: false, message: "Корзина пуста." };
+
+    const norm = (s?: string | null) =>
+      (s || "").toLowerCase().replace(/ё/g, "е").trim();
+    const qn = norm(itemName);
+    let matches = cart.items.filter(
+      (it) => norm(it.name).includes(qn) || qn.includes(norm(it.name))
+    );
+    if (!matches.length) {
+      return {
+        ok: false,
+        message: `В корзине нет «${itemName}». Есть: ${cart.items
+          .map((i) => i.name)
+          .join(", ")}.`,
+      };
+    }
+    if (options.length) {
+      matches = matches.filter((it) =>
+        options.every((o) =>
+          (it.options || []).some((io) => norm(io).includes(norm(o)))
+        )
+      );
+      if (!matches.length) {
+        return {
+          ok: false,
+          message: `«${itemName}» с опциями [${options.join(", ")}] в корзине не найден.`,
+        };
+      }
+    }
+    if (matches.length > 1) {
+      const variants = matches
+        .map((m) => (m.options?.length ? m.options.join("+") : "без опций"))
+        .join(" | ");
+      return {
+        ok: false,
+        message: `«${itemName}» в корзине в нескольких вариантах: ${variants}. Уточни опции для удаления (options).`,
+      };
+    }
+    const chosen = matches[0];
+
+    // Идём на страницу заведения — там панель корзины со строками и счётчиками.
+    if (cart.placeSlug) {
+      await page
+        .goto(`${BASE_URL}/restaurant/${cart.placeSlug}`, {
+          waitUntil: "domcontentloaded",
+        })
+        .catch(() => {});
+      await page.waitForTimeout(3500);
+    }
+    // Находим строку по названию (+ опциям в тексте строки) и жмём «−» до нуля.
+    const nameEls = page
+      .locator('[data-testid="cart-item-name"]')
+      .filter({ hasText: chosen.name });
+    const cnt = await nameEls.count();
+    let row: Locator | null = null;
+    for (let i = 0; i < cnt; i++) {
+      const r = nameEls
+        .nth(i)
+        .locator('xpath=ancestor::*[.//*[@data-testid="amount-select-decrement"]][1]');
+      const t = norm(await r.textContent().catch(() => ""));
+      if (!options.length || options.every((o) => t.includes(norm(o)))) {
+        row = r;
+        break;
+      }
+    }
+    if (!row) {
+      return {
+        ok: false,
+        message: `Строка «${chosen.name}» в панели корзины не найдена (вёрстка изменилась?).`,
+      };
+    }
+    const dec = row.locator('[data-testid="amount-select-decrement"]').first();
+    const qty = Number(chosen.quantity) || 1;
+    for (let k = 0; k < qty; k++) {
+      if (!(await dec.count())) break;
+      await dec.click().catch(() => {});
+      await page.waitForTimeout(1200);
+      const cf = page
+        .locator('button:has-text("Удалить"), button:has-text("Убрать")')
+        .first();
+      if (await cf.isVisible().catch(() => false)) {
+        await cf.click().catch(() => {});
+        await page.waitForTimeout(1000);
+      }
+    }
+    const optNote = chosen.options?.length ? ` (${chosen.options.join(", ")})` : "";
+    return { ok: true, message: `Удалено из корзины: ${chosen.name}${optNote}` };
   }
 
   /**
