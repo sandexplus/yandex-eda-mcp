@@ -182,6 +182,16 @@ export interface MenuItem {
   raw?: unknown;
 }
 
+/** Позиция в корзине (с количеством и выбранными опциями). */
+export interface CartItem {
+  name: string;
+  quantity?: number;
+  price?: number | string;
+  subtotal?: number | string;
+  /** Выбранные опции (вкус/размер/добавки). */
+  options?: string[];
+}
+
 /** Группа опций блюда (вкус/размер/добавки) с вариантами выбора. */
 export interface OptionGroup {
   name: string;
@@ -1134,26 +1144,135 @@ export class YandexEda {
     return { ok: true, message: `Добавлено: ${itemName} ×${quantity}${optNote}` };
   }
 
-  /** Читает состав корзины. */
-  async getCart(): Promise<{ items: MenuItem[]; total?: string; raw?: unknown }> {
-    const page = await this.page();
-    const bodies = await collectJson(page, API.cart, async () => {
-      const cartBtn = await firstVisible(page, SELECTORS.goToCart, 3000);
-      if (cartBtn) await cartBtn.click().catch(() => {});
-      await page.waitForTimeout(1500);
-    });
-    const items = this.parseMenuFromApi(bodies);
-    // Пытаемся найти итоговую сумму в теле.
-    let total: string | undefined;
-    for (const b of bodies as any[]) {
-      total =
-        b?.total?.text ??
-        b?.totalPrice ??
-        b?.payload?.total?.text ??
-        total;
-      if (total) break;
+  /**
+   * Открывает корзину, чтобы подгрузился full-carts и появилась панель с
+   * «Очистить». Принудительно грузим главную (иначе на устаревшей странице
+   * кнопки корзины может не быть), затем открываем drawer кликом по «Корзина»
+   * (эта кнопка есть только когда в корзине что-то есть).
+   */
+  private async openCart(page: Page): Promise<void> {
+    await page.goto(BASE_URL, { waitUntil: "domcontentloaded" });
+    // Кнопка «Корзина»/«Корзины · N» появляется через пару секунд после загрузки
+    // и только когда в корзине что-то есть — ждём её явно.
+    const cartBtn = page
+      .locator('button:has-text("Корзин"), [data-testid="cart-button"]')
+      .first();
+    const has = await cartBtn
+      .waitFor({ state: "visible", timeout: 7000 })
+      .then(() => true, () => false);
+    if (has) {
+      await cartBtn.click().catch(() => {});
+      await page.waitForTimeout(2500);
     }
-    return { items, total, raw: bodies[0] };
+  }
+
+  /** Разбирает корзину из ответа full-carts (`cart.items[]`). */
+  private parseCart(bodies: unknown[]): {
+    items: CartItem[];
+    total?: number | string;
+    subtotal?: number | string;
+    deliveryFee?: number | string;
+    place?: string;
+    placeSlug?: string;
+  } {
+    for (const body of bodies as any[]) {
+      const cart = body?.cart;
+      if (cart && Array.isArray(cart.items)) {
+        const items: CartItem[] = cart.items.map((it: any) => ({
+          name: textVal(it?.name) || "",
+          quantity: it?.quantity ?? it?.count,
+          price: it?.price ?? it?.decimal_price,
+          subtotal: it?.subtotal,
+          options: Array.isArray(it?.item_options)
+            ? it.item_options
+                .map((o: any) => textVal(o?.name) || textVal(o))
+                .filter(Boolean)
+            : undefined,
+        }));
+        return {
+          items,
+          total: cart.total ?? cart.decimal_total,
+          subtotal: cart.subtotal ?? cart.decimal_subtotal,
+          deliveryFee: cart.delivery_fee ?? cart.decimal_delivery_fee,
+          place: textVal(cart.place?.name) || cart.place_slug,
+          placeSlug: cart.place_slug ?? cart.place?.slug,
+        };
+      }
+    }
+    return { items: [] };
+  }
+
+  /** Читает состав корзины (через API full-carts). */
+  async getCart(): Promise<{
+    items: CartItem[];
+    total?: number | string;
+    subtotal?: number | string;
+    deliveryFee?: number | string;
+    place?: string;
+  }> {
+    await this.ensureLoggedIn();
+    const page = await this.page();
+    const bodies = await collectJson(
+      page,
+      /cart\/v\d+\/full-carts/,
+      async () => {
+        await this.openCart(page);
+      },
+      2000
+    );
+    return this.parseCart(bodies);
+  }
+
+  /**
+   * Полностью очищает корзину (кнопка «Очистить»). Нужна, чтобы поменять уже
+   * добавленную позицию с опциями — Яндекс Еда не даёт редактировать опции в
+   * корзине, поэтому старую позицию удаляем и добавляем заново.
+   */
+  async clearCart(): Promise<{ ok: boolean; message: string }> {
+    await this.ensureLoggedIn();
+    const page = await this.page();
+    // Яндекс Еда держит отдельную корзину на каждое заведение. В оверлее «Корзины»
+    // у каждой — иконка-кнопка удаления (без текста). На каждой итерации грузим
+    // главную заново, ждём кнопку корзины, открываем оверлей и удаляем одну.
+    let removed = 0;
+    for (let i = 0; i < 8; i++) {
+      await page.goto(BASE_URL, { waitUntil: "domcontentloaded" }).catch(() => {});
+      const cartsBtn = page
+        .locator('button:has-text("Корзин"), [data-testid="cart-button"]')
+        .first();
+      const has = await cartsBtn
+        .waitFor({ state: "visible", timeout: 7000 })
+        .then(() => true, () => false);
+      if (!has) break; // корзин больше нет
+      await cartsBtn.click().catch(() => {});
+      await page.waitForTimeout(2500);
+      const trash = page
+        .locator(
+          '[data-testid="desktop-popup"] button:has(svg), [role="dialog"] button:has(svg), [class*="opup" i] button:has(svg)'
+        )
+        .filter({ hasNotText: /ресторан|Оформить|заказ|Корзин/i })
+        .first();
+      if (!(await trash.count()) || !(await trash.isVisible().catch(() => false)))
+        break;
+      await trash.click().catch(() => {});
+      await page.waitForTimeout(1500);
+      const confirm = page
+        .locator(
+          'button:has-text("Удалить"), button:has-text("Очистить"), button:has-text("Да")'
+        )
+        .first();
+      if (await confirm.isVisible().catch(() => false)) {
+        await confirm.click().catch(() => {});
+        await page.waitForTimeout(1200);
+      }
+      removed++;
+    }
+    return {
+      ok: true,
+      message: removed
+        ? `Корзина очищена (удалено корзин: ${removed}).`
+        : "Корзина уже пуста.",
+    };
   }
 
   /**

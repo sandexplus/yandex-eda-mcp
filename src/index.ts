@@ -309,7 +309,9 @@ server.registerTool(
       "Меню подгружается лениво — инструмент сам прокручивает страницу до позиции. " +
       "Если у блюда `hasOptions` — СНАЧАЛА вызови get_item_options, чтобы узнать точные " +
       "варианты, и передай выбранные в `options` (значения должны совпадать с вариантами " +
-      "из get_item_options). Без обязательных опций кнопка добавления заблокирована.",
+      "из get_item_options). Без обязательных опций кнопка добавления заблокирована. " +
+      "Чтобы ПОМЕНЯТЬ опции уже добавленной позиции — Яндекс Еда не даёт их редактировать, " +
+      "поэтому вызови clear_cart и добавь заново с новыми options.",
     inputSchema: {
       item: z.string().describe("Название блюда как в меню (get_menu)"),
       quantity: z.number().int().min(1).max(20).optional().default(1),
@@ -332,15 +334,44 @@ server.registerTool(
   "view_cart",
   {
     title: "Показать корзину",
-    description: "Возвращает содержимое корзины и итоговую сумму.",
+    description:
+      "Возвращает содержимое корзины: позиции (с количеством и выбранными опциями), " +
+      "подытог, стоимость доставки и итог.",
     inputSchema: {},
   },
   async () => {
     const cart = await eda.getCart();
+    if (!cart.items.length) return ok("Корзина пуста.");
     return json({
+      place: cart.place,
       total: cart.total,
-      items: cart.items.map((i) => ({ name: i.name, price: i.price })),
+      subtotal: cart.subtotal,
+      deliveryFee: cart.deliveryFee,
+      items: cart.items.map((i) => ({
+        name: i.name,
+        quantity: i.quantity,
+        price: i.price,
+        subtotal: i.subtotal,
+        ...(i.options && i.options.length ? { options: i.options } : {}),
+      })),
     });
+  }
+);
+
+server.registerTool(
+  "clear_cart",
+  {
+    title: "Очистить корзину",
+    description:
+      "Полностью очищает корзину. Нужно, чтобы ПОМЕНЯТЬ уже добавленную позицию с " +
+      "опциями: Яндекс Еда не даёт редактировать опции в корзине, поэтому при смене " +
+      "вкуса/напитка/размера сначала clear_cart, затем add_to_cart с новыми options " +
+      "(при необходимости переспроси у пользователя выбор заново).",
+    inputSchema: {},
+  },
+  async () => {
+    const res = await eda.clearCart();
+    return res.ok ? ok(res.message) : fail(res.message);
   }
 );
 
