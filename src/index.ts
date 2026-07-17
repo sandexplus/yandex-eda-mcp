@@ -134,6 +134,9 @@ server.registerTool(
       "• `query` задавай только когда пользователь ищет конкретное (кухня, блюдо, название).\n" +
       "• `type` разделяет выдачу: `restaurant` (по умолчанию, готовая еда) и `shop` " +
       "(магазины/аптеки/цветы). Каталог смешанный — поэтому по умолчанию отдаём только рестораны.\n" +
+      "• По умолчанию возвращаются только ОТКРЫТЫЕ сейчас (доставляют прямо сейчас). " +
+      "Закрытые/предзаказ скрыты — не предлагай их и не пытайся собрать корзину в закрытом. " +
+      "`includeClosed: true` вернёт и закрытые (у них `open: false`).\n" +
       "Требуется заранее установленный адрес (set_address).",
     inputSchema: {
       query: z
@@ -149,16 +152,24 @@ server.registerTool(
         .describe(
           "restaurant — рестораны (готовая еда, по умолч.); shop — магазины/аптеки/цветы; all — всё вперемешку"
         ),
+      includeClosed: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe(
+          "false (по умолч.) — только открытые сейчас; true — включая закрытые/предзаказ"
+        ),
       limit: z.number().int().min(1).max(50).optional().default(20),
     },
   },
-  async ({ query, type, limit }) => {
-    const list = await eda.searchRestaurants(query, type);
+  async ({ query, type, includeClosed, limit }) => {
+    const list = await eda.searchRestaurants(query, type, includeClosed);
     const sliced = list.slice(0, limit).map((r) => ({
       name: r.name,
       rating: r.rating,
       deliveryTime: r.deliveryTime,
       deliveryPrice: r.deliveryPrice,
+      open: r.open,
       type: r.business,
       url: r.url ?? r.slug,
       categories: r.categories,
@@ -166,8 +177,11 @@ server.registerTool(
     if (!sliced.length) {
       const hint =
         type === "shop" ? "магазинов" : type === "all" ? "заведений" : "ресторанов";
+      const closedNote = includeClosed
+        ? ""
+        : " Возможно, сейчас всё закрыто — попробуйте includeClosed: true.";
       return fail(
-        `Не нашёл ${hint}. Убедитесь, что задан адрес (set_address) и вы вошли (login).`
+        `Не нашёл открытых ${hint}. Убедитесь, что задан адрес (set_address) и вы вошли (login).${closedNote}`
       );
     }
     return json({ count: sliced.length, type, restaurants: sliced });

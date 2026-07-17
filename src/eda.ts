@@ -109,6 +109,17 @@ function textVal(x: any): string | undefined {
 }
 
 /**
+ * Открыто ли заведение по тексту времени доставки. У открытых это ETA с «мин»
+ * («10 – 20 мин»); у закрытых — «Закрыто» или расписание предзаказа
+ * («Сегодня 13:00»). undefined — если текст не распознан.
+ */
+function isOpenByEta(deliveryTime?: string): boolean | undefined {
+  if (!deliveryTime) return undefined;
+  if (/мин/i.test(deliveryTime)) return true;
+  return false;
+}
+
+/**
  * Оценивает, насколько сохранённый адрес подходит под запрос пользователя
  * (больше — лучше, 0 — не подходит). Понимает метки (дом/работа) и совпадение
  * по названию улицы и номеру дома.
@@ -144,6 +155,12 @@ export interface Restaurant {
   deliveryTime?: string;
   /** Стоимость доставки, если удалось распознать (например «Доставка 0₽»). */
   deliveryPrice?: string;
+  /**
+   * Открыт ли сейчас (доставляет прямо сейчас). false — закрыт/только предзаказ
+   * (время доставки «Закрыто» или расписание вида «Сегодня 13:00»).
+   * undefined — определить не удалось.
+   */
+  open?: boolean;
   categories?: string[];
   minOrder?: string;
   raw?: unknown;
@@ -628,17 +645,20 @@ export class YandexEda {
    *   «кто вообще доставляет» ключевые слова НЕ нужны — тут и так все).
    * - `query` задан → полнотекстовый поиск по названию/кухне/блюду.
    * - `type` фильтрует выдачу: "restaurant" (по умолч., готовая еда),
-   *   "shop" (магазины/аптеки/цветы) или "all". Требуется заданный адрес.
+   *   "shop" (магазины/аптеки/цветы) или "all".
+   * - По умолчанию закрытые (только предзаказ) отсеиваются; `includeClosed`
+   *   их вернёт. Требуется заданный адрес.
    */
   async searchRestaurants(
     query?: string,
-    type: PlaceType = "restaurant"
+    type: PlaceType = "restaurant",
+    includeClosed = false
   ): Promise<Restaurant[]> {
     await this.ensureLoggedIn();
     const page = await this.page();
     const q = query?.trim();
 
-    let found: Restaurant[] = [];
+    let parsed: Restaurant[] = [];
     if (q) {
       const bodies = await collectJson(
         page,
@@ -651,7 +671,7 @@ export class YandexEda {
         },
         2500
       );
-      found = this.parseSearchPlaces(bodies);
+      parsed = this.parseSearchPlaces(bodies);
     } else {
       const bodies = await collectJson(
         page,
@@ -662,12 +682,17 @@ export class YandexEda {
         },
         2500
       );
-      found = this.parseCatalogPlaces(bodies);
+      parsed = this.parseCatalogPlaces(bodies);
     }
 
-    if (found.length) return this.filterByType(found, type);
-    // Фолбэк: читаем карточки из DOM (business неизвестен — не фильтруем).
-    return this.parseRestaurantsFromDom(page);
+    if (!parsed.length) {
+      // API ничего не отдал — последняя попытка из DOM (тип/статус неизвестны).
+      return this.parseRestaurantsFromDom(page);
+    }
+    let result = this.filterByType(parsed, type);
+    // Прячем закрытые/предзаказ (open === false), open===undefined оставляем.
+    if (!includeClosed) result = result.filter((p) => p.open !== false);
+    return result;
   }
 
   /** Оставляет заведения нужного типа по полю `business`. */
@@ -706,14 +731,16 @@ export class YandexEda {
                   .map((c: any) => textVal(c?.payload?.text))
                   .find((t: any) => t && /доставк|₽/i.test(t))
               : undefined;
+            const deliveryTime = textVal(eta?.payload?.text);
             out.push({
               name,
               slug,
               business: p.brand?.business,
               url: `${BASE_URL}/restaurant/${slug}`,
               rating: textVal(p.features?.rating?.text),
-              deliveryTime: textVal(eta?.payload?.text),
+              deliveryTime,
               deliveryPrice,
+              open: isOpenByEta(deliveryTime),
             });
           }
         }
@@ -750,6 +777,8 @@ export class YandexEda {
             textVal(p.delivery?.text) ??
             lm.find((t: string) => /мин|\bч\b|\d{1,2}:\d{2}/i.test(t));
           const web = p.link?.web ? String(p.link.web).split("?")[0] : undefined;
+          // Наличие available_from = предзаказ (ещё закрыт); иначе смотрим на ETA.
+          const open = p.available_from ? false : isOpenByEta(deliveryTime);
           out.push({
             name,
             slug,
@@ -757,6 +786,7 @@ export class YandexEda {
             url: web ? `${BASE_URL}${web}` : `${BASE_URL}/restaurant/${slug}`,
             rating,
             deliveryTime,
+            open,
             categories: Array.isArray(p.tags)
               ? p.tags.map((t: any) => t.title || t).filter(Boolean)
               : undefined,
