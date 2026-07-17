@@ -554,6 +554,12 @@ export class YandexEda {
             .find((l) => /подъезд|этаж|кв\./i.test(l));
           if (det && !address.includes(det)) address = address + ", " + det;
         }
+        // Оставляем только то, что похоже на реальный адрес: улица/дом, либо
+        // известная метка (Дом/Работа/…). Отсекаем UI-мусор (Ок/Сохранить/Готово).
+        const looksAddress =
+          /улиц|проспект|переул|шоссе|бульвар|д\.\s?\d|,\s?\d/i.test(address) ||
+          /^(дом|на работу|работа|офис|дача)$/i.test((label || "").trim());
+        if (!looksAddress) continue;
         const key = (label || "") + "|" + address;
         if (seen.has(key)) continue;
         seen.add(key);
@@ -563,15 +569,59 @@ export class YandexEda {
     });
   }
 
+  /** Разбирает сохранённые/недавние адреса из ответа persuggest (надёжно). */
+  private parseZeroSuggest(body: any): SavedAddress[] {
+    const results = body?.results;
+    if (!Array.isArray(results)) return [];
+    const out: SavedAddress[] = [];
+    const seen = new Set<string>();
+    for (const r of results) {
+      let log: any = {};
+      try {
+        log = JSON.parse(r?.log || "{}");
+      } catch {}
+      const where = log?.where || {};
+      const text = (textVal(r?.text) || where?.title || where?.name || "").trim();
+      if (!text) continue;
+      const isLabel = /^(дом|на работу|работа|офис|дача)$/i.test(text);
+      const label = isLabel ? text : undefined;
+      const address = isLabel
+        ? (where?.name || where?.title || text)
+        : text;
+      const looks =
+        isLabel ||
+        /улиц|проспект|переул|шоссе|бульвар|д\.\s?\d|,\s?\d/i.test(address);
+      if (!looks) continue;
+      const key = (label || "") + "|" + address;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({ label, address });
+    }
+    return out;
+  }
+
   /** Возвращает сохранённые в аккаунте адреса доставки. */
   async getSavedAddresses(): Promise<SavedAddress[]> {
     await this.ensureLoggedIn();
     const page = await this.page();
     await this.ensureOnSite(page);
-    if (!(await this.openSavedPopup(page))) return [];
-    const items = await this.readSavedItemsStable(page);
+    // Параллельно ловим ответ persuggest — надёжный источник, не зависит от DOM.
+    let zs: any = null;
+    const handler = async (res: Response) => {
+      try {
+        if (/persuggest\/v1\/(zerosuggest|suggest)/.test(res.url()))
+          zs = await res.json();
+      } catch {}
+    };
+    page.on("response", handler);
+    const opened = await this.openSavedPopup(page);
+    const domItems = opened ? await this.readSavedItemsStable(page) : [];
+    await page.waitForTimeout(400);
+    page.off("response", handler);
     await page.keyboard.press("Escape").catch(() => {});
-    return items;
+    // DOM даёт более полные адреса (с квартирой) — предпочитаем его; иначе API.
+    if (domItems.length) return domItems;
+    return this.parseZeroSuggest(zs);
   }
 
   /**
