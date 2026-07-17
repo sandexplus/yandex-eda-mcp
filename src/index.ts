@@ -193,33 +193,62 @@ server.registerTool(
   {
     title: "Меню ресторана",
     description:
-      "Открывает ресторан и возвращает его меню. Принимает URL или slug из search_restaurants.",
+      "Возвращает ПОЛНОЕ меню ресторана, сгруппированное по категориям (URL или slug " +
+      "из search_restaurants). По умолчанию компактно — без описаний, чтобы влезли " +
+      "все позиции (у крупных ресторанов их 200+): не делай выводов «такого нет», " +
+      "пока не просмотрел все категории. `full: true` добавит описания блюд. " +
+      "У позиций с `hasOptions` при добавлении нужен выбор вкуса/размера (options).",
     inputSchema: {
       restaurant: z
         .string()
         .describe("URL ресторана или его slug (из результатов поиска)"),
-      limit: z.number().int().min(1).max(200).optional().default(80),
+      full: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe("true — добавить описания блюд (дороже по объёму)"),
+      limit: z
+        .number()
+        .int()
+        .min(1)
+        .max(600)
+        .optional()
+        .default(400)
+        .describe("Максимум позиций (по умолч. 400 — обычно всё меню)"),
     },
   },
-  async ({ restaurant, limit }) => {
+  async ({ restaurant, full, limit }) => {
     const { restaurant: name, items } = await eda.getMenu(restaurant);
     if (!items.length) {
       return fail(
         `Меню для «${name}» не распознано. Возможно, ресторан недоступен по текущему адресу.`
       );
     }
-    return json({
-      restaurant: name,
-      count: items.length,
-      items: items.slice(0, limit).map((i) => ({
+    const capped = items.slice(0, limit);
+    // Группируем по категориям, сохраняя порядок меню.
+    const byCat = new Map<string, any[]>();
+    for (const i of capped) {
+      const cat = i.category || "Прочее";
+      if (!byCat.has(cat)) byCat.set(cat, []);
+      byCat.get(cat)!.push({
         name: i.name,
         price: i.price,
-        weight: i.weight,
-        category: i.category,
-        // Позиции с опциями требуют выбора вкуса/размера при add_to_cart (options).
-        hasOptions: i.hasOptions,
-        description: i.description,
-      })),
+        ...(i.weight ? { weight: i.weight } : {}),
+        ...(i.hasOptions ? { hasOptions: true } : {}),
+        ...(full && i.description ? { description: i.description } : {}),
+      });
+    }
+    const categories = [...byCat].map(([cat, list]) => ({
+      category: cat,
+      items: list,
+    }));
+    return json({
+      restaurant: name,
+      count: capped.length,
+      totalItems: items.length,
+      truncated: items.length > capped.length || undefined,
+      categoriesCount: categories.length,
+      categories,
     });
   }
 );
