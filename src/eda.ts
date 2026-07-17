@@ -236,6 +236,13 @@ async function collectJson(
 }
 
 export class YandexEda {
+  /**
+   * Вход подтверждён в этом процессе. Как только сессия найдена/выполнен вход —
+   * больше не дёргаем проверку и не открываем окно на каждое действие (это
+   * защита от любой флакости детекта куки). Сбрасывается только явным `login`.
+   */
+  private authConfirmed = false;
+
   private async page(): Promise<Page> {
     return browserManager.getPage();
   }
@@ -292,21 +299,40 @@ export class YandexEda {
   }
 
   /**
+   * Закрывает headed-контекст и уходит в headless, ПЕРЕНОСЯ куки напрямую —
+   * чтобы не зависеть от того, успела ли сессия дописаться в профиль на диск
+   * (иначе новый headless-контекст мог бы не увидеть свежий Session_id, и сервер
+   * снова открывал бы окно входа на каждое действие).
+   */
+  private async goHeadlessWithSession(fromCtx: BrowserContext): Promise<void> {
+    const cookies = await fromCtx.cookies().catch(() => []);
+    const headless = await browserManager.reopen(true);
+    if (cookies.length) await headless.addCookies(cookies).catch(() => {});
+    this.authConfirmed = true; // сессия найдена — фиксируем, окно больше не нужно
+  }
+
+  /**
    * Интерактивный вход: поднимает видимое окно браузера в том же профиле,
    * ведёт на страницу входа Яндекса и ждёт, пока пользователь авторизуется
    * (логин/пароль/SMS/капча). Готовность ловим по появлению куки `Session_id`,
-   * не трогая страницу входа. После входа возвращаемся в headless.
+   * не трогая страницу входа. После входа возвращаемся в headless, перенося куки.
    */
   async interactiveLogin(
     timeoutMs = LOGIN_TIMEOUT
   ): Promise<{ ok: boolean; message: string }> {
+    // Проверяем БЕЗ открытия окна — вдруг уже авторизованы.
+    if (await this.isAuthenticated()) {
+      this.authConfirmed = true;
+      return { ok: true, message: "Уже авторизованы — вход не потребовался." };
+    }
+
     // Видимое окно обязательно — капча/SMS в headless невозможны.
     const ctx = await browserManager.reopen(false);
     const page = ctx.pages()[0] ?? (await ctx.newPage());
 
-    // Уже есть валидная сессия? Тогда вход не нужен.
+    // Сессия могла появиться в профиле между проверками.
     if (await this.hasSessionCookie(ctx)) {
-      await browserManager.reopen(true);
+      await this.goHeadlessWithSession(ctx);
       return { ok: true, message: "Уже авторизованы — вход не потребовался." };
     }
 
@@ -322,11 +348,11 @@ export class YandexEda {
       await page.waitForTimeout(2000);
       if (await this.hasSessionCookie(ctx)) {
         await page.waitForTimeout(1500); // дать докатиться остальным кукам
-        await browserManager.reopen(true);
+        await this.goHeadlessWithSession(ctx);
         return {
           ok: true,
           message:
-            "Вход выполнен, сессия сохранена в профиль. Дальше работаю headless.",
+            "Вход выполнен, сессия сохранена. Дальше работаю headless — окно больше не откроется.",
         };
       }
     }
@@ -345,7 +371,11 @@ export class YandexEda {
    * открывает окно входа. Иначе бросает понятную ошибку.
    */
   async ensureLoggedIn(): Promise<void> {
-    if (await this.isAuthenticated()) return;
+    if (this.authConfirmed) return; // уже входили в этом процессе — не дёргаем окно
+    if (await this.isAuthenticated()) {
+      this.authConfirmed = true;
+      return;
+    }
     if (!isAutoLogin()) {
       throw new Error(
         "Профиль не авторизован. Вызовите инструмент `login` (или задайте YANDEX_EDA_AUTO_LOGIN=1)."
