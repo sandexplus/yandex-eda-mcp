@@ -477,12 +477,31 @@ server.registerTool(
 );
 
 server.registerTool(
+  "list_payment_methods",
+  {
+    title: "Способы оплаты",
+    description:
+      "Показывает доступные способы оплаты (карты, Карта Пэй, СБП) и текущий выбранный. " +
+      "Нужна НЕПУСТАЯ корзина (способы видны только на экране оформления). " +
+      "ВАЖНО: СБП требует ручного подтверждения в приложении банка и НЕ оформится " +
+      "автоматически — для авто-заказа выбирайте карту/Карту Пэй (параметр payment у place_order).",
+    inputSchema: {},
+  },
+  async () => {
+    const res = await eda.getPaymentMethods();
+    return res.methods.length ? ok(res.message) : fail(res.message);
+  }
+);
+
+server.registerTool(
   "place_order",
   {
     title: "Оформить заказ",
     description:
       "Оформляет заказ из корзины. ПО УМОЛЧАНИЮ безопасный dry-run: доходит до кнопки " +
-      "оформления, но НЕ подтверждает. Для реального заказа передайте confirm=true.",
+      "«Оплатить», но НЕ подтверждает. Для реального заказа передайте confirm=true. " +
+      "Через payment можно заранее выбрать способ оплаты (см. list_payment_methods). " +
+      "СБП автоматически НЕ проходит (нужно приложение банка) — для авто-заказа payment должен быть картой.",
     inputSchema: {
       confirm: z
         .boolean()
@@ -490,10 +509,16 @@ server.registerTool(
         .default(false)
         .describe("true = реально оформить заказ и списать оплату"),
       comment: z.string().optional().describe("Комментарий курьеру/ресторану"),
+      payment: z
+        .string()
+        .optional()
+        .describe(
+          'Способ оплаты по названию, напр. "Карта Пэй" или "СБП" (см. list_payment_methods)'
+        ),
     },
   },
-  async ({ confirm, comment }) => {
-    const res = await eda.placeOrder({ confirm, comment });
+  async ({ confirm, comment, payment }) => {
+    const res = await eda.placeOrder({ confirm, comment, payment });
     return res.ok ? ok(res.message) : fail(res.message);
   }
 );

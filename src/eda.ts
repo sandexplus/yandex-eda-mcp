@@ -274,6 +274,13 @@ export class YandexEda {
    */
   private authConfirmed = false;
 
+  /**
+   * Индекс «категория → имена товаров» последнего get_menu. Нужен add_to_cart:
+   * страница ресторана рендерит карточки только выбранной категории, поэтому
+   * перед поиском карточки надо кликнуть категорию, в которой лежит товар.
+   */
+  private menuCatalog: { name: string; items: Set<string> }[] = [];
+
   private async page(): Promise<Page> {
     return browserManager.getPage();
   }
@@ -1005,7 +1012,77 @@ export class YandexEda {
       restaurantUrlOrSlug;
 
     const items = this.parseMenuFromApi(bodies);
+    this.menuCatalog = this.buildCategoryIndex(bodies);
     return { restaurant: restaurant.trim(), items };
+  }
+
+  /** Строит индекс «категория → нормализованные имена товаров» из ответа API. */
+  private buildCategoryIndex(
+    bodies: unknown[]
+  ): { name: string; items: Set<string> }[] {
+    const norm = (s: string) =>
+      s.toLowerCase().replace(/ё/g, "е").replace(/\s+/g, " ").trim();
+    const out: { name: string; items: Set<string> }[] = [];
+    for (const body of bodies as any[]) {
+      const cats = body?.payload?.categories ?? body?.categories;
+      if (!Array.isArray(cats)) continue;
+      const collect = (cat: any) => {
+        const name = textVal(cat?.name);
+        if (name && Array.isArray(cat?.items)) {
+          const set = new Set<string>();
+          cat.items.forEach((it: any) => {
+            const n = textVal(it?.name ?? it?.title);
+            if (n) set.add(norm(n));
+          });
+          if (set.size) out.push({ name, items: set });
+        }
+        if (Array.isArray(cat?.categories)) cat.categories.forEach(collect);
+      };
+      cats.forEach(collect);
+    }
+    return out;
+  }
+
+  /**
+   * Категории, в которых встречается товар (для навигации перед добавлением).
+   * Не-псевдо категории (не «Вы заказывали»/«Популярное») идут первыми — там
+   * товар лежит в гриде, а не в горизонтальной карусели. В конец добавляются
+   * все прочие категории как крайний перебор.
+   */
+  private categoriesFor(itemName: string): string[] {
+    const norm = (s: string) =>
+      s.toLowerCase().replace(/ё/g, "е").replace(/\s+/g, " ").trim();
+    const q = norm(itemName);
+    const PSEUDO =
+      /вы заказывали|популярн|выбор пользоват|новинк|только в доставке|хиты|рекоменд|акци/i;
+    const rank = (arr: string[]) =>
+      arr.sort((a, b) => (PSEUDO.test(a) ? 1 : 0) - (PSEUDO.test(b) ? 1 : 0));
+    const exact: string[] = [];
+    const partial: string[] = [];
+    for (const c of this.menuCatalog) {
+      if (c.items.has(q)) exact.push(c.name);
+      else if ([...c.items].some((n) => n.includes(q) || q.includes(n)))
+        partial.push(c.name);
+    }
+    const primary = [...new Set([...rank(exact), ...rank(partial)])];
+    const rest = this.menuCatalog
+      .map((c) => c.name)
+      .filter((n) => !primary.includes(n));
+    return [...primary, ...rank(rest)];
+  }
+
+  /** Кликает по вкладке категории в меню ресторана (точное совпадение имени). */
+  private async clickCategory(page: Page, name: string): Promise<boolean> {
+    const esc = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const rx = new RegExp(`^\\s*${esc}\\s*$`);
+    const link = page
+      .locator('a, button, [role="tab"], [role="link"]')
+      .filter({ hasText: rx })
+      .first();
+    if (!(await link.count())) return false;
+    await link.scrollIntoViewIfNeeded().catch(() => {});
+    await link.click().catch(() => {});
+    return true;
   }
 
   /** Разбирает optionsGroups блюда из API в удобный вид. */
@@ -1109,23 +1186,87 @@ export class YandexEda {
   }
 
   /**
-   * Находит карточку блюда по названию, прокручивая меню — сайт подгружает
-   * позиции лениво, по мере прокрутки до их категории.
+   * Находит карточку блюда по названию. Страница ресторана рендерит карточки
+   * только ВЫБРАННОЙ категории (грид ~7 карточек, не длинный список), поэтому
+   * сначала кликаем категорию товара (из индекса меню), затем ищем карточку в
+   * гриде. Клик по карточке из поиска перехватывается шапкой — поэтому именно
+   * навигация по категориям, а не поиск.
    */
   private async findMenuItemCard(page: Page, itemName: string) {
     const sel = '[data-testid="product-card-v2-root"]';
-    const byName = () => page.locator(sel).filter({ hasText: itemName }).first();
-    for (let step = 0; step < 20; step++) {
-      if (await byName().count()) return byName();
-      const atBottom = await page.evaluate(() => {
-        const y = window.scrollY;
-        window.scrollBy(0, 1100);
-        return window.scrollY === y;
-      });
-      await page.waitForTimeout(500);
-      if (atBottom) break;
+    const titleSel = '[data-testid="product-card-v2-title"]';
+    const norm = (s: string) =>
+      s.toLowerCase().replace(/ё/g, "е").replace(/\s+/g, " ").trim();
+    const target = norm(itemName);
+    // Выбор лучшей карточки строго по ИМЕНИ (title), а не по всему тексту:
+    // иначе «Соус Сырный» цепляет «Соус Сырный + Соус Сырный», а короткий
+    // запрос — товар-суперсет. Точное совпадение приоритетнее подстроки.
+    const pickBest = async (loc: Locator): Promise<Locator | null> => {
+      const n = await loc.count();
+      if (!n) return null;
+      let bestIdx = -1;
+      let bestScore = -1;
+      for (let i = 0; i < Math.min(n, 25); i++) {
+        const title = norm(
+          await loc.nth(i).locator(titleSel).first().innerText().catch(() => "")
+        );
+        if (!title) continue;
+        let score: number;
+        if (title === target) score = 100;
+        else if (title.startsWith(target))
+          score = 60 - Math.min(title.length - target.length, 50);
+        else if (title.includes(target)) score = 30;
+        else if (target.includes(title)) score = 20;
+        else continue; // имя вообще не совпало — не наша карточка
+        if (score > bestScore) {
+          bestScore = score;
+          bestIdx = i;
+        }
+        if (score === 100) break;
+      }
+      return bestIdx >= 0 ? loc.nth(bestIdx) : null;
+    };
+
+    // Ищет карточку в текущем гриде, немного прокручивая (грид виртуализирован).
+    const findInGrid = async (): Promise<Locator | null> => {
+      for (let s = 0; s < 14; s++) {
+        const best = await pickBest(page.locator(sel));
+        if (best) return best;
+        await page.evaluate(() => window.scrollBy(0, 1100)).catch(() => {});
+        await page.waitForTimeout(400);
+      }
+      return await pickBest(page.locator(sel));
+    };
+
+    // 1) Навигация по КАТЕГОРИИ товара — грид рендерится без перехвата шапкой.
+    for (const cat of this.categoriesFor(itemName)) {
+      if (await this.clickCategory(page, cat)) {
+        await page.waitForTimeout(1400);
+        const best = await findInGrid();
+        if (best) return best;
+      }
     }
-    return (await byName().count()) ? byName() : null;
+
+    // 2) Фолбэк: прокрутка всей страницы (если категорий в индексе нет).
+    const filtered = () => page.locator(sel).filter({ hasText: itemName });
+    let lastHeight = 0;
+    let stable = 0;
+    for (let step = 0; step < 25; step++) {
+      const best = await pickBest(filtered());
+      if (best) return best;
+      const height = await page.evaluate(() => {
+        window.scrollBy(0, 1400);
+        return document.body.scrollHeight;
+      });
+      await page.waitForTimeout(450);
+      if (height === lastHeight) {
+        if (++stable >= 3) break;
+      } else {
+        stable = 0;
+        lastHeight = height;
+      }
+    }
+    return await pickBest(filtered());
   }
 
   /**
@@ -1149,32 +1290,42 @@ export class YandexEda {
     }
     await card.scrollIntoViewIfNeeded().catch(() => {});
 
-    // Простой случай: опции не заданы и на карточке есть счётчик «+».
-    const plus = card
-      .locator('[data-testid="product-card-v2-counter-increase-btn"]')
-      .first();
-    if (!options.length && (await plus.count())) {
-      await plus.click().catch(() => {});
-      await page.waitForTimeout(900);
-      const modalOpened = await page
+    // Железобетонно: всегда открываем карточку товара и добавляем ЧЕРЕЗ МОДАЛКУ.
+    // Клик по «+» на карточке (особенно из результатов поиска) даёт ЛОЖНЫЙ
+    // успех — рапортует, но в корзину не кладёт. Клик по названию надёжно
+    // открывает модалку (с ретраями).
+    const opened = await this.openItemModal(page, card);
+    if (!opened) {
+      return {
+        ok: false,
+        message: `Не удалось открыть карточку «${itemName}» (после 3 попыток).`,
+      };
+    }
+    return this.addFromItemModal(page, itemName, quantity, options);
+  }
+
+  /** Надёжно открывает модалку товара кликом по карточке (до 3 попыток). */
+  private async openItemModal(page: Page, card: Locator): Promise<boolean> {
+    const isOpen = () =>
+      page
         .locator('[data-testid="product-full-card-name"]')
         .isVisible()
         .catch(() => false);
-      if (!modalOpened) {
-        // Добавилось прямо на карточке — докликиваем нужное количество.
-        for (let i = 1; i < quantity; i++) {
-          await plus.click().catch(() => {});
-          await page.waitForTimeout(400);
-        }
-        return { ok: true, message: `Добавлено: ${itemName} ×${quantity}` };
-      }
-      // Иначе открылась карточка товара (нужны опции) — обрабатываем ниже.
-    } else {
+    const title = card.locator('[data-testid="product-card-v2-title"]').first();
+    for (let i = 0; i < 3; i++) {
+      // Клик по самой карточке (центр = картинка/название) открывает модалку;
+      // «+» — маленькая кнопка в углу, в центр не попадаем.
       await card.click().catch(() => {});
-      await page.waitForTimeout(1500);
+      await page.waitForTimeout(1300);
+      if (await isOpen()) return true;
+      // Запасной клик по названию.
+      if (await title.count()) {
+        await title.click().catch(() => {});
+        await page.waitForTimeout(1200);
+        if (await isOpen()) return true;
+      }
     }
-
-    return this.addFromItemModal(page, itemName, quantity, options);
+    return false;
   }
 
   /** Добавляет из открытой карточки товара: выбор опций, количество, «Добавить». */
@@ -1233,8 +1384,27 @@ export class YandexEda {
           `затем add_to_cart с options: [...] (например options: ["Воппер Беконез"]).`,
       };
     }
+    // Жмём «Добавить» и проверяем, что добавилось: после успешного добавления
+    // модалка закрывается. Если осталась открытой — повторяем клик один раз,
+    // иначе честно сообщаем о неудаче (без ложного «Добавлено»).
+    const modalGone = async () =>
+      !(await page
+        .locator('[data-testid="product-full-card-name"]')
+        .isVisible()
+        .catch(() => false));
     await addBtn.click().catch(() => {});
-    await page.waitForTimeout(1200);
+    await page.waitForTimeout(1500);
+    if (!(await modalGone())) {
+      await addBtn.click().catch(() => {});
+      await page.waitForTimeout(1500);
+    }
+    if (!(await modalGone())) {
+      await page.keyboard.press("Escape").catch(() => {});
+      return {
+        ok: false,
+        message: `Не удалось добавить «${itemName}» — карточка не подтвердила добавление (кнопка «Добавить» не сработала).`,
+      };
+    }
     const optNote = options.length ? ` (${options.join(", ")})` : "";
     return { ok: true, message: `Добавлено: ${itemName} ×${quantity}${optNote}` };
   }
@@ -1832,11 +2002,32 @@ export class YandexEda {
   async placeOrder(opts: {
     confirm?: boolean;
     comment?: string;
+    payment?: string;
   }): Promise<{ ok: boolean; placed: boolean; message: string }> {
+    await this.ensureLoggedIn();
     const page = await this.page();
-    const cartBtn = await firstVisible(page, SELECTORS.goToCart, 4000);
-    if (cartBtn) await cartBtn.click().catch(() => {});
-    await page.waitForTimeout(1000);
+    const onCheckout = await this.gotoCheckout(page);
+    if (!onCheckout) {
+      const diag = await this.checkoutDiag(page);
+      return {
+        ok: false,
+        placed: false,
+        message:
+          "Не удалось открыть экран оформления (кнопка «Оплатить» не найдена). " +
+          `Проверьте, что корзина не пуста и адрес задан. На экране: ${diag}`,
+      };
+    }
+
+    // Выбор способа оплаты (если задан). Критично для авто-оформления: СБП
+    // требует подтверждения в банковском приложении, а карта/Пэй списывается
+    // сразу — только с ними заказ проходит без ручного шага.
+    let paymentNote = "";
+    if (opts.payment) {
+      const sel = await this.selectPaymentMethodOnCheckout(page, opts.payment);
+      paymentNote = sel.ok
+        ? ` Способ оплаты переключён на «${sel.chosen}».`
+        : ` ⚠ Способ оплаты НЕ переключён (${sel.message}).`;
+    }
 
     if (opts.comment) {
       const commentField = page
@@ -1847,39 +2038,305 @@ export class YandexEda {
       }
     }
 
-    const submit = await firstVisible(page, SELECTORS.placeOrderButton, 5000);
-    if (!submit) {
+    // Финальная кнопка оплаты на экране оформления.
+    const pay = await firstVisible(
+      page,
+      [
+        'button:has-text("Оплатить")',
+        '[data-testid="checkout-submit"]',
+        'button:has-text("Оформить заказ")',
+        'button:has-text("Заказать")',
+      ],
+      8000
+    );
+    if (!pay) {
+      const diag = await this.checkoutDiag(page);
       return {
         ok: false,
         placed: false,
         message:
-          "Кнопка оформления не найдена. Проверьте, что корзина не пуста и адрес/оплата заданы.",
+          "Финальная кнопка оплаты не найдена. " + `На экране: ${diag}`,
       };
     }
 
+    const current = await this.readCurrentPayment(page);
+
     if (!opts.confirm) {
-      const label = await submit.innerText().catch(() => "Оформить заказ");
+      const label =
+        ((await pay.innerText().catch(() => "Оплатить")) || "Оплатить").trim();
       return {
         ok: true,
         placed: false,
-        message: `Dry-run: доступна кнопка «${label.trim()}». Заказ НЕ оформлен. Передайте confirm=true для реального оформления.`,
+        message:
+          `Dry-run: дошёл до финальной кнопки «${label}». Способ оплаты: «${current}».${paymentNote} ` +
+          `Заказ НЕ оформлен, деньги НЕ списаны. Для реального оформления передайте confirm=true.` +
+          (/сбп/i.test(current)
+            ? ` ВНИМАНИЕ: выбран СБП — он требует подтверждения в приложении банка и не оформится автоматически. Передайте payment:"Карта Пэй" (или другую карту).`
+            : ""),
       };
     }
 
+    let confirmedModal = "";
     const bodies = await collectJson(page, API.order, async () => {
-      await submit.click();
+      await pay.click();
+      await page.waitForTimeout(2500);
+      // После «Оплатить» Яндекс может показать модалку подтверждения адреса
+      // («Заказ на этот адрес? — <адрес> — Да/Нет»). Без клика по «Да» заказ
+      // не создаётся — обрабатываем её (может всплыть не сразу, ждём/повторяем).
+      for (let i = 0; i < 4; i++) {
+        const hit = await this.confirmOrderModal(page);
+        if (hit) {
+          confirmedModal = hit;
+          await page.waitForTimeout(2500);
+          break;
+        }
+        await page.waitForTimeout(1200);
+      }
       await page.waitForTimeout(3000);
     });
     const created = (bodies as any[]).some(
       (b) => b?.orderId || b?.order?.id || b?.payload?.orderId
     );
+    if (created) {
+      return {
+        ok: true,
+        placed: true,
+        message:
+          `Заказ оформлен ✅ (получен orderId от API). Оплата: «${current}».${paymentNote}` +
+          (confirmedModal ? ` Подтверждена модалка: «${confirmedModal}».` : ""),
+      };
+    }
+    // orderId не пойман — диагностика экрана. При СБП это ожидаемо: всплывает
+    // модалка оплаты «Перейти в банк» — заказ создаётся, но ждёт оплаты в банке.
+    const diag = await this.checkoutDiag(page);
+    const sbp = /сбп/i.test(current) || /банк|перейти в банк/i.test(diag);
     return {
-      ok: true,
-      placed: true,
-      message: created
-        ? "Заказ оформлен ✅ (получен orderId от API)."
-        : "Кнопка нажата, но подтверждение orderId не перехвачено — проверьте статус через get_orders.",
+      ok: sbp,
+      placed: sbp,
+      message:
+        `Кнопка «Оплатить» нажата.${paymentNote} Оплата: «${current}». ` +
+        (sbp
+          ? `Похоже, оплата идёт через СБП — Яндекс создал заказ, но ждёт подтверждения в приложении банка (авто-оформление невозможно). Проверьте заказ и подтвердите оплату в приложении, либо переключитесь на карту: payment:"Карта Пэй".`
+          : confirmedModal
+          ? `Модалка «${confirmedModal}» подтверждена, но orderId не пойман — проверьте список заказов.`
+          : `orderId не пойман. На экране: ${diag}`),
     };
+  }
+
+  /**
+   * Доводит до экрана оформления: грузит главную, открывает оверлей корзины,
+   * жмёт «Оформить заказ» (переход на /checkout) и ждёт кнопку «Оплатить».
+   * Возвращает true, если экран оформления с «Оплатить» открылся.
+   */
+  private async gotoCheckout(page: Page): Promise<boolean> {
+    await this.openCart(page);
+    await page.waitForTimeout(1000);
+    // «Оформить заказ» в оверлее — лишь переход на экран оформления, где
+    // реальная финальная кнопка называется «Оплатить».
+    const toCheckout = await firstVisible(
+      page,
+      ['button:has-text("Оформить заказ")', '[data-testid="checkout-submit"]'],
+      6000
+    );
+    if (toCheckout) {
+      await toCheckout.click().catch(() => {});
+      await page
+        .locator('button:has-text("Оплатить")')
+        .first()
+        .waitFor({ state: "visible", timeout: 8000 })
+        .catch(() => {});
+      await page.waitForTimeout(800);
+    }
+    return await page
+      .locator('button:has-text("Оплатить")')
+      .first()
+      .isVisible()
+      .catch(() => false);
+  }
+
+  /** Читает текущий способ оплаты из блока «Способ оплаты» на экране оформления. */
+  private async readCurrentPayment(page: Page): Promise<string> {
+    const t = await page
+      .locator('text=Способ оплаты')
+      .first()
+      .locator("xpath=..")
+      .innerText()
+      .catch(() => "");
+    return (
+      t
+        .replace(/Способ оплаты/i, "")
+        .replace(/Изменить/i, "")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 60) || "не определён"
+    );
+  }
+
+  /**
+   * На экране оформления открывает пикер оплаты («Изменить») и выбирает метод
+   * по названию. Строки — это `label[for="payment-method-N"]` со скрытым radio;
+   * матчим по aria-label (с синонимами), кликаем label и подтверждаем «Выбрать».
+   */
+  private async selectPaymentMethodOnCheckout(
+    page: Page,
+    query: string
+  ): Promise<{ ok: boolean; chosen?: string; available: string[]; message: string }> {
+    const change = await firstVisible(
+      page,
+      ['button:has-text("Изменить")', 'a:has-text("Изменить")'],
+      4000
+    );
+    if (!change)
+      return { ok: false, available: [], message: "кнопка «Изменить» не найдена" };
+    await change.click().catch(() => {});
+    await page.waitForTimeout(2000);
+    const labels = await page
+      .locator('label[for^="payment-method-"]')
+      .evaluateAll((els) =>
+        els
+          .map((e) => ({
+            id: e.getAttribute("for") || "",
+            name: (e.getAttribute("aria-label") || "").trim(),
+          }))
+          .filter((l) => l.name)
+      );
+    const available = labels.map((l) => l.name);
+    if (!labels.length)
+      return { ok: false, available, message: "список способов оплаты пуст" };
+    const norm = (s: string) =>
+      s.toLowerCase().replace(/ё/g, "е").replace(/\s+/g, " ").trim();
+    const q = norm(query);
+    let hit =
+      labels.find((l) => norm(l.name) === q) ||
+      labels.find((l) => norm(l.name).includes(q)) ||
+      labels.find((l) => q.includes(norm(l.name)));
+    if (!hit && /(карт|пэй|pay|плюс|plus|баланс)/.test(q))
+      hit = labels.find((l) => /карта пэй|пэй/i.test(l.name));
+    if (!hit && /(т-?банк|тинько|tbank|tinkoff)/.test(q))
+      hit = labels.find((l) => /т-?банк/i.test(l.name));
+    if (!hit && /(сбп|sbp)/.test(q))
+      hit =
+        labels.find((l) => /^сбп$/i.test(l.name)) ||
+        labels.find((l) => /сбп/i.test(l.name));
+    if (!hit)
+      return {
+        ok: false,
+        available,
+        message: `«${query}» нет среди: ${available.join(", ")}`,
+      };
+    const lab = page.locator(`label[for="${hit.id}"]`).first();
+    await lab.click({ force: true }).catch(async () => {
+      await page.locator(`#${hit!.id}`).check({ force: true }).catch(() => {});
+    });
+    await page.waitForTimeout(800);
+    const choose = page.locator('button:has-text("Выбрать")').first();
+    if (await choose.isVisible().catch(() => false)) {
+      await choose.click().catch(() => {});
+      await page.waitForTimeout(2000);
+    }
+    return { ok: true, chosen: hit.name, available, message: `выбран ${hit.name}` };
+  }
+
+  /**
+   * Список доступных способов оплаты (карты/СБП) на экране оформления и текущий
+   * выбранный. Нужна непустая корзина — иначе экран оформления не открыть.
+   */
+  async getPaymentMethods(): Promise<{
+    methods: string[];
+    current: string;
+    message: string;
+  }> {
+    await this.ensureLoggedIn();
+    const page = await this.page();
+    const onCheckout = await this.gotoCheckout(page);
+    if (!onCheckout)
+      return {
+        methods: [],
+        current: "",
+        message:
+          "Не удалось открыть экран оформления — корзина пуста? Добавьте товар, чтобы увидеть способы оплаты.",
+      };
+    const current = await this.readCurrentPayment(page);
+    const change = await firstVisible(
+      page,
+      ['button:has-text("Изменить")', 'a:has-text("Изменить")'],
+      4000
+    );
+    if (change) {
+      await change.click().catch(() => {});
+      await page.waitForTimeout(2000);
+    }
+    const methods = await page
+      .locator('label[for^="payment-method-"]')
+      .evaluateAll((els) =>
+        els.map((e) => (e.getAttribute("aria-label") || "").trim()).filter(Boolean)
+      );
+    await page.keyboard.press("Escape").catch(() => {});
+    return {
+      methods,
+      current,
+      message: methods.length
+        ? `Способы оплаты: ${methods.join(", ")}. Текущий: ${current}.`
+        : "Способы оплаты не распознаны.",
+    };
+  }
+
+  /**
+   * Ищет модалку подтверждения после «Оформить» (напр. «Заказ на этот адрес?
+   * — Да/Нет») и жмёт утвердительную кнопку. Возвращает текст-подпись модалки,
+   * если что-то нажали, иначе "". Утвердительную кнопку ищем строго по тексту
+   * (да/заказать/подтвердить/всё верно), чтобы не задеть «Нет»/«Отмена».
+   */
+  private async confirmOrderModal(page: Page): Promise<string> {
+    const modal = page
+      .locator('[role="dialog"], [class*="odal" i], [class*="opup" i]')
+      .filter({ hasText: /этот адрес|адрес\?|всё верно|все верно|подтвер|верно ли/i })
+      .first();
+    if (!(await modal.isVisible().catch(() => false))) return "";
+    const caption = (await modal.innerText().catch(() => ""))
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 80);
+    const yes = modal
+      .locator("button")
+      .filter({
+        hasText: /^\s*(да|заказать|оформить( заказ)?|подтвердить|всё верно|все верно|верно)\s*$/i,
+      })
+      .first();
+    if (await yes.isVisible().catch(() => false)) {
+      await yes.click().catch(() => {});
+      return caption || "модалка подтверждения";
+    }
+    // Утвердительной по тексту нет — берём основную (не-«Нет»/не-«Отмена»).
+    const primary = modal
+      .locator("button")
+      .filter({ hasNotText: /нет|отмен|измен|назад|закрыть/i })
+      .first();
+    if (await primary.isVisible().catch(() => false)) {
+      await primary.click().catch(() => {});
+      return caption || "модалка подтверждения";
+    }
+    return "";
+  }
+
+  /** Короткая диагностика экрана оформления (заголовки модалок + видимые кнопки). */
+  private async checkoutDiag(page: Page): Promise<string> {
+    const modalTxt = await page
+      .locator('[role="dialog"], [class*="odal" i], [class*="opup" i]')
+      .first()
+      .innerText()
+      .then((t) => t.replace(/\s+/g, " ").trim().slice(0, 160))
+      .catch(() => "");
+    const btns = await page
+      .locator("button:visible")
+      .allInnerTexts()
+      .then((a) =>
+        [...new Set(a.map((s) => s.replace(/\s+/g, " ").trim()).filter(Boolean))]
+          .slice(0, 12)
+          .join(" | ")
+      )
+      .catch(() => "");
+    return `${modalTxt ? `модалка: «${modalTxt}»; ` : ""}кнопки: [${btns}]`;
   }
 
   /** Делает скриншот текущей страницы для диагностики. */
